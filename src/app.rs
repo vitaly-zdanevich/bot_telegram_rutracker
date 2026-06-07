@@ -32,7 +32,7 @@ const HELP_TEXT: &str = concat!(
     "https://core.telegram.org/bots/api#senddocument\n\n",
     "Torrent downloads use librqbit, the rqbit torrent client library: ",
     "https://github.com/ikatson/rqbit\n\n",
-    "AWS Lambda can run one invocation for at most 900 seconds, 15 minutes: ",
+    "AWS Lambda can run one invocation for at most 15 minutes: ",
     "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
     "If RuTracker is unavailable, I return the official news channel link: @rutracker_news. ",
     "RuTracker runs on low-cost community infrastructure; please consider donating to them.\n\n",
@@ -1775,6 +1775,8 @@ mod tests {
                 "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html"
             )
         );
+        assert!(HELP_TEXT.contains("at most 15 minutes"));
+        assert!(!HELP_TEXT.contains("900 seconds"));
         assert!(HELP_TEXT.contains("unofficial bot"));
         assert!(HELP_TEXT.contains("donating"));
         assert!(HELP_TEXT.contains("seed legal torrents"));
