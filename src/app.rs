@@ -48,7 +48,7 @@ const RUTRACKER_UNAVAILABLE_TEXT: &str = concat!(
     "RuTracker is unavailable from this Lambda right now. ",
     "Check their official news channel for status: ",
     "<a href=\"https://t.me/rutracker_news\">@rutracker_news</a>. ",
-    "They run on low-cost community infrastructure; please consider donating to them."
+    "RuTracker runs on low-cost community infrastructure; please consider donating to them."
 );
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
@@ -159,6 +159,7 @@ impl App {
             config.rutracker_cookie.as_deref(),
             rutracker_credentials,
             config.http_timeout_seconds,
+            config.http_max_attempts,
         )?;
         Ok(Self {
             config,

@@ -17,6 +17,7 @@ locals {
       RUTRACKER_BASE_URLS            = var.rutracker_base_urls
       SEARCH_LIMIT                   = "10"
       RUTRACKER_HTTP_TIMEOUT_SECONDS = "30"
+      RUTRACKER_HTTP_MAX_ATTEMPTS    = "2"
       MAX_FILE_MB                    = "50"
       LAMBDA_TIMEOUT_SECONDS         = "900"
       DOWNLOAD_MARGIN_SECONDS        = "20"

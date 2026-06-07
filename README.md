@@ -95,6 +95,7 @@ Environment variables:
 - `RUTRACKER_USERNAME` and `RUTRACKER_PASSWORD`, optional authenticated search credentials
 - `RUTRACKER_COOKIE`, optional fallback; credentials are preferred
 - `SEARCH_LIMIT`, default `10`
+- `RUTRACKER_HTTP_MAX_ATTEMPTS`, default `2`
 - `MAX_FILE_MB`, default `50`
 - `LAMBDA_TIMEOUT_SECONDS`, default `900`
 - `DOWNLOAD_MARGIN_SECONDS`, default `20`

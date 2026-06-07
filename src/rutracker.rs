@@ -8,6 +8,7 @@ use regex::Regex;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 use tracing::{info, warn};
 use url::Url;
 
@@ -17,6 +18,7 @@ pub struct RutrackerClient {
     base_urls: Vec<Url>,
     credentials: Option<RutrackerCredentials>,
     logged_in_base_urls: Arc<Mutex<HashSet<String>>>,
+    max_attempts: usize,
 }
 
 #[derive(Clone)]
@@ -109,6 +111,7 @@ impl RutrackerClient {
         cookie: Option<&str>,
         credentials: Option<RutrackerCredentials>,
         timeout_seconds: u64,
+        max_attempts: usize,
     ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         if credentials.is_some() && cookie.is_some() {
@@ -154,6 +157,7 @@ impl RutrackerClient {
             base_urls,
             credentials,
             logged_in_base_urls: Arc::new(Mutex::new(HashSet::new())),
+            max_attempts: max_attempts.max(1),
         })
     }
 
@@ -164,8 +168,42 @@ impl RutrackerClient {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let fields = search_form_fields(query, forum_id);
-        let (html, base_url) = self.post_forum_form("tracker.php", &fields).await?;
-        let mut results = parse_search_results(&html, &base_url)?;
+        let body = cp1251_form(&fields);
+        let mut last_error = None;
+
+        for base_url in &self.base_urls {
+            match self.search_base_url(base_url, body.clone(), limit).await {
+                Ok(results) => return Ok(results),
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("no RuTracker base URLs configured")))
+    }
+
+    async fn search_base_url(
+        &self,
+        base_url: &Url,
+        body: Vec<u8>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        if let Err(err) = self.ensure_logged_in(base_url).await {
+            warn!(base_url = %base_url, error = %err, "RuTracker login failed");
+            return Err(err);
+        }
+
+        let url = forum_url_for(base_url, "tracker.php")?;
+        let html = self.post_body_with_retries(url, body).await?;
+        let mut results = parse_search_results(&html, base_url).map_err(|err| {
+            warn!(
+                base_url = %base_url,
+                error = %err,
+                "failed to parse RuTracker search results"
+            );
+            err
+        })?;
         results.truncate(limit);
         Ok(results)
     }
@@ -261,71 +299,10 @@ impl RutrackerClient {
             let mut url = forum_url_for(base_url, path)?;
             configure_url(&mut url);
 
-            match self.http.get(url.clone()).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(response) => match decode_response(response).await {
-                        Ok(html) => return Ok((html, base_url.clone())),
-                        Err(err) => {
-                            warn!(url = %url, error = %err, "failed to decode RuTracker response");
-                            last_error = Some(err);
-                        }
-                    },
-                    Err(err) => {
-                        warn!(url = %url, error = %err, "RuTracker request failed");
-                        last_error = Some(anyhow!(err));
-                    }
-                },
+            match self.get_html_with_retries(url).await {
+                Ok(html) => return Ok((html, base_url.clone())),
                 Err(err) => {
-                    warn!(url = %url, error = %err, "RuTracker request failed");
-                    last_error = Some(anyhow!(err));
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow!("no RuTracker base URLs configured")))
-    }
-
-    async fn post_forum_form(
-        &self,
-        path: &str,
-        fields: &[(&str, String)],
-    ) -> Result<(String, Url)> {
-        let body = cp1251_form(fields);
-        let mut last_error = None;
-
-        for base_url in &self.base_urls {
-            if let Err(err) = self.ensure_logged_in(base_url).await {
-                warn!(base_url = %base_url, error = %err, "RuTracker login failed");
-                last_error = Some(err);
-                continue;
-            }
-
-            let url = forum_url_for(base_url, path)?;
-
-            match self
-                .http
-                .post(url.clone())
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(body.clone())
-                .send()
-                .await
-            {
-                Ok(response) => match response.error_for_status() {
-                    Ok(response) => match decode_response(response).await {
-                        Ok(html) => return Ok((html, base_url.clone())),
-                        Err(err) => {
-                            warn!(url = %url, error = %err, "failed to decode RuTracker response");
-                            last_error = Some(err);
-                        }
-                    },
-                    Err(err) => {
-                        warn!(url = %url, error = %err, "RuTracker request failed");
-                        last_error = Some(anyhow!(err));
-                    }
-                },
-                Err(err) => {
-                    warn!(url = %url, error = %err, "RuTracker request failed");
-                    last_error = Some(anyhow!(err));
+                    last_error = Some(err);
                 }
             }
         }
@@ -360,17 +337,10 @@ impl RutrackerClient {
     ) -> Result<()> {
         let url = forum_url_for(base_url, "login.php")?;
         let fields = login_form_fields(&credentials.username, &credentials.password);
-        let response = self
-            .http
-            .post(url.clone())
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(cp1251_form(&fields))
-            .send()
+        let html = self
+            .post_body_with_retries(url, cp1251_form(&fields))
             .await
             .with_context(|| format!("RuTracker login request failed for {base_url}"))?;
-        let status = response.status();
-        let final_url = response.url().clone();
-        let html = decode_response(response).await?;
 
         if login_succeeded(&html) {
             info!(base_url = %base_url, "RuTracker login succeeded");
@@ -381,7 +351,110 @@ impl RutrackerClient {
             bail!("RuTracker login failed; check RUTRACKER_USERNAME and RUTRACKER_PASSWORD");
         }
 
-        bail!("RuTracker login failed with status {status} at {final_url}");
+        bail!("RuTracker login failed; success marker was not present in the response");
+    }
+
+    async fn get_html_with_retries(&self, url: Url) -> Result<String> {
+        let mut last_error = None;
+        for attempt in 1..=self.max_attempts {
+            match self.http.get(url.clone()).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match decode_response(response).await {
+                        Ok(html) => return Ok(html),
+                        Err(err) => {
+                            warn!(
+                                url = %url,
+                                attempt,
+                                max_attempts = self.max_attempts,
+                                error = %err,
+                                "failed to decode RuTracker response"
+                            );
+                            last_error = Some(err);
+                        }
+                    },
+                    Err(err) => {
+                        warn!(
+                            url = %url,
+                            attempt,
+                            max_attempts = self.max_attempts,
+                            error = %err,
+                            "RuTracker request failed"
+                        );
+                        last_error = Some(anyhow!(err));
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        url = %url,
+                        attempt,
+                        max_attempts = self.max_attempts,
+                        error = %err,
+                        "RuTracker request failed"
+                    );
+                    last_error = Some(anyhow!(err));
+                }
+            }
+            self.sleep_before_next_attempt(attempt).await;
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("RuTracker request failed without error")))
+    }
+
+    async fn post_body_with_retries(&self, url: Url, body: Vec<u8>) -> Result<String> {
+        let mut last_error = None;
+        for attempt in 1..=self.max_attempts {
+            match self
+                .http
+                .post(url.clone())
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match decode_response(response).await {
+                        Ok(html) => return Ok(html),
+                        Err(err) => {
+                            warn!(
+                                url = %url,
+                                attempt,
+                                max_attempts = self.max_attempts,
+                                error = %err,
+                                "failed to decode RuTracker response"
+                            );
+                            last_error = Some(err);
+                        }
+                    },
+                    Err(err) => {
+                        warn!(
+                            url = %url,
+                            attempt,
+                            max_attempts = self.max_attempts,
+                            error = %err,
+                            "RuTracker request failed"
+                        );
+                        last_error = Some(anyhow!(err));
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        url = %url,
+                        attempt,
+                        max_attempts = self.max_attempts,
+                        error = %err,
+                        "RuTracker request failed"
+                    );
+                    last_error = Some(anyhow!(err));
+                }
+            }
+            self.sleep_before_next_attempt(attempt).await;
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("RuTracker request failed without error")))
+    }
+
+    async fn sleep_before_next_attempt(&self, attempt: usize) {
+        if attempt < self.max_attempts {
+            sleep(Duration::from_millis(250 * attempt as u64)).await;
+        }
     }
 }
 
