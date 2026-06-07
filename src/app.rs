@@ -426,14 +426,13 @@ impl App {
             .or_else(|| result.author.as_ref().map(|name| html_escape(name)))
             .unwrap_or_else(|| "unknown".to_string());
         let message_text = format!(
-            "<b>{}</b>\nCategory: {}\nAuthor: {}\nSize: {}\nSeeds: {}\nDownloads: {}\nLink: <a href=\"{}\">RuTracker page</a>",
-            html_escape(title),
+            "{}\nCategory: {}\nAuthor: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            topic_title_link(title, &result.topic_url),
             category_line,
             author,
             format_bytes(size),
             seeds,
             downloads,
-            html_escape(&result.topic_url),
         );
         let magnet = details.and_then(|details| details.magnet.as_deref());
         let mut buttons = vec![vec![url_button("RuTracker", &result.topic_url)]];
@@ -542,14 +541,13 @@ impl App {
             .map(str::to_string);
 
         let message = format!(
-            "<b>{}</b>\nCategory: {}\nAuthor: {}\nSize: {}\nSeeds: {}\nDownloads: {}\nLink: <a href=\"{}\">RuTracker page</a>",
-            html_escape(title),
+            "{}\nCategory: {}\nAuthor: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            topic_title_link(title, &result.topic_url),
             category_line,
             author,
             format_bytes(size),
             seeds,
             downloads,
-            html_escape(&result.topic_url),
         );
 
         let mut rows = vec![
@@ -1739,11 +1737,19 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn topic_title_link(title: &str, topic_url: &str) -> String {
+    format!(
+        "<a href=\"{}\">{}</a>",
+        html_escape(topic_url),
+        html_escape(title)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, format_bytes,
-        telegram_command_name,
+        telegram_command_name, topic_title_link,
     };
 
     #[test]
@@ -1759,6 +1765,17 @@ mod tests {
             Some("help")
         );
         assert_eq!(telegram_command_name("hello"), None);
+    }
+
+    #[test]
+    fn formats_topic_title_as_link() {
+        assert_eq!(
+            topic_title_link(
+                "A & B",
+                "https://rutracker.org/forum/viewtopic.php?t=42&x=1"
+            ),
+            "<a href=\"https://rutracker.org/forum/viewtopic.php?t=42&amp;x=1\">A &amp; B</a>"
+        );
     }
 
     #[test]
