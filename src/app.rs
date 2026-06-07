@@ -248,6 +248,10 @@ impl App {
             .message
             .as_ref()
             .and_then(|message| message.reply_markup.clone());
+        let callback_text = callback
+            .message
+            .as_ref()
+            .and_then(|message| message.text.clone());
 
         if let Some(topic_id) = data.strip_prefix("dl:").and_then(parse_u64) {
             self.telegram
@@ -305,7 +309,15 @@ impl App {
             self.telegram
                 .answer_callback(&callback.id, "Loading files...")
                 .await?;
-            return self.handle_files(chat_id, topic_id).await;
+            return self
+                .handle_files(
+                    chat_id,
+                    topic_id,
+                    callback_message,
+                    callback_reply_markup,
+                    callback_text,
+                )
+                .await;
         }
         if let Some(topic_id) = data.strip_prefix("mag:").and_then(parse_u64) {
             self.telegram
@@ -722,6 +734,7 @@ impl App {
                 &html_escape(&truncate_for_telegram(&topic.description_text, 3000)),
             )?
         };
+        let reply_markup = remove_callback_button(reply_markup, &format!("desc:{topic_id}"));
         if let Some(progress) = progress {
             self.telegram
                 .edit_message(progress, &text, reply_markup)
@@ -803,17 +816,111 @@ impl App {
         ))
     }
 
-    async fn handle_files(&self, chat_id: i64, topic_id: u64) -> Result<()> {
+    fn topic_message_with_files(
+        &self,
+        topic: &TopicDetails,
+        files: &str,
+        include_description: bool,
+    ) -> Result<String> {
+        let description = if include_description && !topic.description_text.is_empty() {
+            Some(html_escape(&truncate_for_telegram(
+                &topic.description_text,
+                2400,
+            )))
+        } else {
+            None
+        };
+        let mut text = match description.as_deref() {
+            Some(description) => self.topic_message_with_description(topic, description)?,
+            None => self.topic_message_header(topic)?,
+        };
+        text.push_str("\n\n");
+        text.push_str(files);
+        Ok(text)
+    }
+
+    fn topic_message_header(&self, topic: &TopicDetails) -> Result<String> {
+        let title = if topic.title.is_empty() {
+            "RuTracker topic"
+        } else {
+            &topic.title
+        };
+        let category_line = match topic.category_path.last() {
+            Some(category) => format!(
+                "<a href=\"{}\">{}</a>",
+                html_escape(&self.rutracker.category_url(category.id)?),
+                html_escape(&category.name)
+            ),
+            None => "unknown".to_string(),
+        };
+        let metadata_lines = format_topic_metadata_lines(topic);
+        let metadata_block = if metadata_lines.is_empty() {
+            String::new()
+        } else {
+            format!("{metadata_lines}\n")
+        };
+        let author = topic
+            .author
+            .as_ref()
+            .map(format_author)
+            .unwrap_or_else(|| "unknown".to_string());
+        let size = topic
+            .total_size_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unknown".to_string());
+        let seeds = topic
+            .seeds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let downloads = topic
+            .downloads
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Ok(format!(
+            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            topic_title_link(title, &self.rutracker.topic_url(topic.topic_id)?),
+            category_line,
+            metadata_block,
+            author,
+            size,
+            seeds,
+            downloads
+        ))
+    }
+
+    async fn handle_files(
+        &self,
+        chat_id: i64,
+        topic_id: u64,
+        message_to_edit: Option<ProgressMessage>,
+        reply_markup: Option<Value>,
+        current_text: Option<String>,
+    ) -> Result<()> {
         let topic = match self.cached_topic(topic_id).await {
             Ok(topic) => topic,
             Err(err) => {
-                self.send_rutracker_unavailable(chat_id, &err).await?;
+                if let Some(message_to_edit) = message_to_edit {
+                    self.edit_rutracker_unavailable(message_to_edit, &err)
+                        .await?;
+                } else {
+                    self.send_rutracker_unavailable(chat_id, &err).await?;
+                }
                 return Ok(());
             }
         };
+        let include_description = message_has_section(current_text.as_deref(), "Description");
+        let reply_markup = remove_callback_button(reply_markup, &format!("files:{topic_id}"));
         if !topic.first_post_files.is_empty() {
-            let text = files_from_topic_text(&topic, self.config.max_file_mb);
-            self.telegram.send_message(chat_id, &text, None).await?;
+            let files = files_from_topic_text(&topic, self.config.max_file_mb);
+            let text = self.topic_message_with_files(&topic, &files, include_description)?;
+            if let Some(message_to_edit) = message_to_edit {
+                self.telegram
+                    .edit_message(message_to_edit, &text, reply_markup)
+                    .await?;
+            } else {
+                self.telegram.send_message(chat_id, &text, None).await?;
+            }
             return Ok(());
         }
 
@@ -829,8 +936,15 @@ impl App {
         {
             Ok(metadata) => {
                 self.telegram.try_delete_message(progress).await;
-                let text = files_from_metadata_text(&metadata.files, self.config.max_file_mb);
-                self.telegram.send_message(chat_id, &text, None).await?;
+                let files = files_from_metadata_text(&metadata.files, self.config.max_file_mb);
+                let text = self.topic_message_with_files(&topic, &files, include_description)?;
+                if let Some(message_to_edit) = message_to_edit {
+                    self.telegram
+                        .edit_message(message_to_edit, &text, reply_markup)
+                        .await?;
+                } else {
+                    self.telegram.send_message(chat_id, &text, None).await?;
+                }
             }
             Err(err) => {
                 self.telegram
@@ -1860,6 +1974,40 @@ fn topic_title_link(title: &str, topic_url: &str) -> String {
     )
 }
 
+fn message_has_section(text: Option<&str>, section: &str) -> bool {
+    text.is_some_and(|text| text.lines().any(|line| line.trim() == section))
+}
+
+fn remove_callback_button(reply_markup: Option<Value>, callback_data: &str) -> Option<Value> {
+    let mut reply_markup = reply_markup?;
+    let Some(rows) = reply_markup
+        .get_mut("inline_keyboard")
+        .and_then(Value::as_array_mut)
+    else {
+        return Some(reply_markup);
+    };
+
+    let mut filtered_rows = Vec::with_capacity(rows.len());
+    for row in std::mem::take(rows) {
+        match row {
+            Value::Array(buttons) => {
+                let buttons = buttons
+                    .into_iter()
+                    .filter(|button| {
+                        button.get("callback_data").and_then(Value::as_str) != Some(callback_data)
+                    })
+                    .collect::<Vec<_>>();
+                if !buttons.is_empty() {
+                    filtered_rows.push(Value::Array(buttons));
+                }
+            }
+            other => filtered_rows.push(other),
+        }
+    }
+    *rows = filtered_rows;
+    Some(reply_markup)
+}
+
 fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
     let mut lines = Vec::new();
     if let Some(release_type) = topic.release_type.as_ref() {
@@ -1878,7 +2026,8 @@ fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
 mod tests {
     use super::{
         HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, author_name_link,
-        format_bytes, format_topic_metadata_lines, telegram_command_name, topic_title_link,
+        callback_button, format_bytes, format_topic_metadata_lines, inline_keyboard,
+        message_has_section, remove_callback_button, telegram_command_name, topic_title_link,
     };
 
     #[test]
@@ -1916,6 +2065,62 @@ mod tests {
             ),
             "<a href=\"https://rutracker.org/forum/profile.php?mode=viewprofile&amp;u=12\">artist &amp; author</a>"
         );
+    }
+
+    #[test]
+    fn detects_plain_text_sections() {
+        assert!(message_has_section(
+            Some("Title\n\nDescription\ntext"),
+            "Description"
+        ));
+        assert!(!message_has_section(
+            Some("Title with Description word"),
+            "Description"
+        ));
+    }
+
+    #[test]
+    fn removes_used_callback_button_from_reply_markup() {
+        let markup = inline_keyboard(vec![
+            vec![
+                callback_button("Download", "dl:42"),
+                callback_button("Description", "desc:42"),
+            ],
+            vec![callback_button("Files", "files:42")],
+        ]);
+
+        let filtered = remove_callback_button(Some(markup), "desc:42").unwrap();
+        let rows = filtered
+            .get("inline_keyboard")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0][0]
+                .get("callback_data")
+                .and_then(serde_json::Value::as_str),
+            Some("dl:42")
+        );
+        assert_eq!(rows[0].as_array().unwrap().len(), 1);
+        assert_eq!(
+            rows[1][0]
+                .get("callback_data")
+                .and_then(serde_json::Value::as_str),
+            Some("files:42")
+        );
+
+        let filtered = remove_callback_button(
+            Some(inline_keyboard(vec![vec![callback_button(
+                "Files", "files:42",
+            )]])),
+            "files:42",
+        )
+        .unwrap();
+        let rows = filtered
+            .get("inline_keyboard")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
