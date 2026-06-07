@@ -25,6 +25,7 @@ use crate::telegram_safe_file_bytes;
 use crate::torrent::{TorrentFile, TorrentMetadata};
 
 const HELP_TEXT: &str = concat!(
+    "This is an unofficial bot and is not affiliated with RuTracker.\n\n",
     "Send a RuTracker search string. I search rutracker.org titles and return matching topics.\n\n",
     "Use <code>c text</code> to search categories. Category buttons from normal search results rerun the same query inside that category.\n\n",
     "Download only sends files smaller than 50 MB because Telegram Bot API documents bot uploads with sendDocument as limited to 50 MB: ",
@@ -33,7 +34,8 @@ const HELP_TEXT: &str = concat!(
     "https://github.com/ikatson/rqbit\n\n",
     "AWS Lambda can run one invocation for at most 900 seconds, 15 minutes: ",
     "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
-    "If RuTracker is unavailable, I return the official news channel link: @rutracker_news.\n\n",
+    "If RuTracker is unavailable, I return the official news channel link: @rutracker_news. ",
+    "RuTracker runs on low-cost community infrastructure; please consider donating to them.\n\n",
     "Source code: https://github.com/vitaly-zdanevich/bot_telegram_rutracker"
 );
 
@@ -41,7 +43,8 @@ const RUTRACKER_NEWS_URL: &str = "https://t.me/rutracker_news";
 const RUTRACKER_UNAVAILABLE_TEXT: &str = concat!(
     "RuTracker is unavailable from this Lambda right now. ",
     "Check their official news channel for status: ",
-    "<a href=\"https://t.me/rutracker_news\">@rutracker_news</a>."
+    "<a href=\"https://t.me/rutracker_news\">@rutracker_news</a>. ",
+    "They run on low-cost community infrastructure; please consider donating to them."
 );
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
@@ -1757,15 +1760,18 @@ mod tests {
     fn rutracker_unavailable_message_points_to_news_channel() {
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("@rutracker_news"));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains(RUTRACKER_NEWS_URL));
+        assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("donating"));
     }
 
     #[test]
-    fn help_mentions_torrent_client_and_lambda_timeout_docs() {
+    fn help_mentions_limits_unofficial_status_and_donations() {
         assert!(HELP_TEXT.contains("https://github.com/ikatson/rqbit"));
         assert!(
             HELP_TEXT.contains(
                 "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html"
             )
         );
+        assert!(HELP_TEXT.contains("unofficial bot"));
+        assert!(HELP_TEXT.contains("donating"));
     }
 }
