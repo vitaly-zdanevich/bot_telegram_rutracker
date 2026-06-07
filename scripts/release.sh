@@ -41,7 +41,7 @@ if middle:
 else:
     patch += 1
 version = f"{major}.{minor}.{patch}"
-text = text[:match.start(1)] + version + text[match.end(1):]
+text = text[:match.start()] + f'version = "{version}"' + text[match.end():]
 path.write_text(text)
 print(version)
 PY

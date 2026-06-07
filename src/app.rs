@@ -29,6 +29,10 @@ const HELP_TEXT: &str = concat!(
     "Use <code>c text</code> to search categories. Category buttons from normal search results rerun the same query inside that category.\n\n",
     "Download only sends files smaller than 50 MB because Telegram Bot API documents bot uploads with sendDocument as limited to 50 MB: ",
     "https://core.telegram.org/bots/api#senddocument\n\n",
+    "Torrent downloads use librqbit, the rqbit torrent client library: ",
+    "https://github.com/ikatson/rqbit\n\n",
+    "AWS Lambda can run one invocation for at most 900 seconds, 15 minutes: ",
+    "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
     "If RuTracker is unavailable, I return the official news channel link: @rutracker_news.\n\n",
     "Source code: https://github.com/vitaly-zdanevich/bot_telegram_rutracker"
 );
@@ -1720,7 +1724,8 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, format_bytes, telegram_command_name,
+        HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, format_bytes,
+        telegram_command_name,
     };
 
     #[test]
@@ -1742,5 +1747,15 @@ mod tests {
     fn rutracker_unavailable_message_points_to_news_channel() {
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("@rutracker_news"));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains(RUTRACKER_NEWS_URL));
+    }
+
+    #[test]
+    fn help_mentions_torrent_client_and_lambda_timeout_docs() {
+        assert!(HELP_TEXT.contains("https://github.com/ikatson/rqbit"));
+        assert!(
+            HELP_TEXT.contains(
+                "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html"
+            )
+        );
     }
 }
