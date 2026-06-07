@@ -1,0 +1,958 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use encoding_rs::WINDOWS_1251;
+use regex::Regex;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
+use scraper::{ElementRef, Html, Selector};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+use url::Url;
+
+#[derive(Clone)]
+pub struct RutrackerClient {
+    http: reqwest::Client,
+    base_urls: Vec<Url>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub topic_id: u64,
+    pub title: String,
+    pub author: Option<String>,
+    pub category: Option<CategoryRef>,
+    pub size_bytes: u64,
+    pub seeds: i64,
+    pub downloads: u64,
+    pub topic_url: String,
+    pub category_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CategoryRef {
+    pub id: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TopicDetails {
+    pub topic_id: u64,
+    pub title: String,
+    pub author: Option<AuthorDetails>,
+    pub category_path: Vec<CategoryRef>,
+    pub total_size_bytes: Option<u64>,
+    pub seeds: Option<i64>,
+    pub downloads: Option<u64>,
+    pub magnet: Option<String>,
+    pub description_text: String,
+    pub description_html: String,
+    pub first_post_images: Vec<String>,
+    pub first_post_files: Vec<TopicFile>,
+    pub comments: Vec<TopicComment>,
+    pub comments_page: u32,
+    pub comments_total_pages: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorDetails {
+    pub name: String,
+    pub posts_count: Option<u64>,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopicComment {
+    pub author: Option<AuthorDetails>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopicFile {
+    pub path: String,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForumNode {
+    pub id: u64,
+    pub name: String,
+    pub parent_id: Option<u64>,
+}
+
+impl RutrackerClient {
+    pub fn new(base_urls: &[String], cookie: Option<&str>, timeout_seconds: u64) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        if let Some(cookie) = cookie {
+            headers.insert(
+                COOKIE,
+                HeaderValue::from_str(cookie).context("RUTRACKER_COOKIE is not a valid header")?,
+            );
+        }
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .default_headers(headers)
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/vitaly-zdanevich/bot_telegram_rutracker)"
+            ))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .context("failed to build RuTracker HTTP client")?;
+
+        let base_urls = base_urls
+            .iter()
+            .map(|base_url| {
+                let mut base_url = base_url.to_string();
+                if !base_url.ends_with('/') {
+                    base_url.push('/');
+                }
+                Url::parse(&base_url).context("RUTRACKER_BASE_URLS must contain only URLs")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if base_urls.is_empty() {
+            bail!("RUTRACKER_BASE_URLS must contain at least one URL");
+        }
+
+        Ok(Self { http, base_urls })
+    }
+
+    pub async fn search(
+        &self,
+        query: &str,
+        forum_id: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let fields = search_form_fields(query, forum_id);
+        let (html, base_url) = self.post_forum_form("tracker.php", &fields).await?;
+        let mut results = parse_search_results(&html, &base_url)?;
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    pub async fn latest_in_forum(&self, forum_id: u64, limit: usize) -> Result<Vec<SearchResult>> {
+        let (html, base_url) = self
+            .get_forum_html("tracker.php", |url| {
+                url.query_pairs_mut()
+                    .append_pair("f", &forum_id.to_string());
+            })
+            .await?;
+        let mut results = parse_search_results(&html, &base_url)?;
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    pub async fn topic(&self, topic_id: u64) -> Result<TopicDetails> {
+        self.topic_page(topic_id, 1).await
+    }
+
+    pub async fn topic_page(&self, topic_id: u64, page: u32) -> Result<TopicDetails> {
+        let page = page.max(1);
+        let (html, base_url) = self
+            .get_forum_html("viewtopic.php", |url| {
+                url.query_pairs_mut()
+                    .append_pair("t", &topic_id.to_string());
+                if page > 1 {
+                    url.query_pairs_mut()
+                        .append_pair("start", &((page - 1) * 30).to_string());
+                }
+            })
+            .await?;
+        parse_topic_page(&html, topic_id, page, &base_url)
+    }
+
+    pub async fn categories(&self) -> Result<Vec<ForumNode>> {
+        let (html, _) = self.get_forum_html("index.php", |_| {}).await?;
+        Ok(parse_forum_nodes(&html))
+    }
+
+    pub async fn forum_subcategories(&self, forum_id: u64) -> Result<Vec<ForumNode>> {
+        let (html, _) = self
+            .get_forum_html("viewforum.php", |url| {
+                url.query_pairs_mut()
+                    .append_pair("f", &forum_id.to_string());
+            })
+            .await?;
+        let mut nodes = parse_forum_nodes(&html);
+        nodes.retain(|node| node.id != forum_id);
+        for node in &mut nodes {
+            node.parent_id = Some(forum_id);
+        }
+        dedupe_forums(nodes)
+    }
+
+    pub fn topic_url(&self, topic_id: u64) -> Result<String> {
+        let mut url = self.forum_url("viewtopic.php")?;
+        url.query_pairs_mut()
+            .append_pair("t", &topic_id.to_string());
+        Ok(url.to_string())
+    }
+
+    pub fn category_url(&self, forum_id: u64) -> Result<String> {
+        let mut url = self.forum_url("viewforum.php")?;
+        url.query_pairs_mut()
+            .append_pair("f", &forum_id.to_string());
+        Ok(url.to_string())
+    }
+
+    fn forum_url(&self, path: &str) -> Result<Url> {
+        forum_url_for(self.primary_base_url()?, path)
+    }
+
+    fn primary_base_url(&self) -> Result<&Url> {
+        self.base_urls
+            .first()
+            .ok_or_else(|| anyhow!("no RuTracker base URLs configured"))
+    }
+
+    async fn get_forum_html<F>(&self, path: &str, configure_url: F) -> Result<(String, Url)>
+    where
+        F: Fn(&mut Url),
+    {
+        let mut last_error = None;
+
+        for base_url in &self.base_urls {
+            let mut url = forum_url_for(base_url, path)?;
+            configure_url(&mut url);
+
+            match self.http.get(url.clone()).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match decode_response(response).await {
+                        Ok(html) => return Ok((html, base_url.clone())),
+                        Err(err) => {
+                            warn!(url = %url, error = %err, "failed to decode RuTracker response");
+                            last_error = Some(err);
+                        }
+                    },
+                    Err(err) => {
+                        warn!(url = %url, error = %err, "RuTracker request failed");
+                        last_error = Some(anyhow!(err));
+                    }
+                },
+                Err(err) => {
+                    warn!(url = %url, error = %err, "RuTracker request failed");
+                    last_error = Some(anyhow!(err));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("no RuTracker base URLs configured")))
+    }
+
+    async fn post_forum_form(
+        &self,
+        path: &str,
+        fields: &[(&str, String)],
+    ) -> Result<(String, Url)> {
+        let body = cp1251_form(fields);
+        let mut last_error = None;
+
+        for base_url in &self.base_urls {
+            let url = forum_url_for(base_url, path)?;
+
+            match self
+                .http
+                .post(url.clone())
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match decode_response(response).await {
+                        Ok(html) => return Ok((html, base_url.clone())),
+                        Err(err) => {
+                            warn!(url = %url, error = %err, "failed to decode RuTracker response");
+                            last_error = Some(err);
+                        }
+                    },
+                    Err(err) => {
+                        warn!(url = %url, error = %err, "RuTracker request failed");
+                        last_error = Some(anyhow!(err));
+                    }
+                },
+                Err(err) => {
+                    warn!(url = %url, error = %err, "RuTracker request failed");
+                    last_error = Some(anyhow!(err));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("no RuTracker base URLs configured")))
+    }
+}
+
+fn forum_url_for(base_url: &Url, path: &str) -> Result<Url> {
+    base_url
+        .join(path)
+        .with_context(|| format!("failed to build RuTracker URL for {path}"))
+}
+
+fn search_form_fields(query: &str, forum_id: Option<u64>) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("nm", query.to_string()),
+        ("max", "1".to_string()),
+        ("tm", "-1".to_string()),
+        ("o", "10".to_string()),
+        ("s", "2".to_string()),
+    ];
+    if let Some(forum_id) = forum_id {
+        fields.push(("f", forum_id.to_string()));
+    }
+    fields
+}
+
+async fn decode_response(response: reqwest::Response) -> Result<String> {
+    let bytes = response.bytes().await?;
+    let (decoded, _, _) = WINDOWS_1251.decode(&bytes);
+    Ok(decoded.into_owned())
+}
+
+fn selector(value: &str) -> Selector {
+    Selector::parse(value).expect("static selector is valid")
+}
+
+fn text(el: ElementRef<'_>) -> String {
+    html_escape::decode_html_entities(
+        &el.text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+    .trim()
+    .to_string()
+}
+
+fn attr_url(base_url: &Url, value: &str) -> Option<String> {
+    if value.starts_with("data:") {
+        return None;
+    }
+    base_url.join(value).ok().map(|url| url.to_string())
+}
+
+fn cp1251_form(fields: &[(&str, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push(b'&');
+        }
+        percent_form_encode_bytes(key.as_bytes(), &mut out);
+        out.push(b'=');
+        let (encoded, _, _) = WINDOWS_1251.encode(value);
+        percent_form_encode_bytes(&encoded, &mut out);
+    }
+    out
+}
+
+fn percent_form_encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    for &byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                out.push(byte);
+            }
+            b' ' => out.push(b'+'),
+            other => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push(b'%');
+                out.push(HEX[(other >> 4) as usize]);
+                out.push(HEX[(other & 0x0f) as usize]);
+            }
+        }
+    }
+}
+
+pub fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<SearchResult>> {
+    let doc = Html::parse_document(html);
+    let mut results = Vec::new();
+
+    for row in doc.select(&selector("#tor-tbl tbody tr, tr.hl-tr, tr.tCenter")) {
+        let Some(title_link) = row
+            .select(&selector(
+                "a.tLink, a[data-topic_id], a[href*=\"viewtopic.php?t=\"]",
+            ))
+            .next()
+        else {
+            continue;
+        };
+        let Some(topic_id) = extract_topic_id(title_link) else {
+            continue;
+        };
+
+        let title = text(title_link);
+        if title.is_empty() {
+            continue;
+        }
+
+        let category = row
+            .select(&selector(
+                ".f-name a, td.f-name-col a, a[href*=\"viewforum.php?f=\"]",
+            ))
+            .find_map(|link| {
+                let id = link
+                    .value()
+                    .attr("href")
+                    .and_then(extract_forum_id_from_href)?;
+                let name = text(link);
+                (!name.is_empty()).then_some(CategoryRef { id, name })
+            });
+
+        let topic_url = base_url
+            .join(&format!("viewtopic.php?t={topic_id}"))
+            .map(|url| url.to_string())?;
+        let category_url = category
+            .as_ref()
+            .and_then(|category| {
+                base_url
+                    .join(&format!("viewforum.php?f={}", category.id))
+                    .ok()
+            })
+            .map(|url| url.to_string());
+
+        results.push(SearchResult {
+            topic_id,
+            title,
+            author: extract_author(row),
+            category,
+            size_bytes: extract_size_from_row(row),
+            seeds: extract_seed_count(row),
+            downloads: extract_download_count(row),
+            topic_url,
+            category_url,
+        });
+    }
+
+    Ok(results)
+}
+
+fn extract_topic_id(link: ElementRef<'_>) -> Option<u64> {
+    link.value()
+        .attr("data-topic_id")
+        .and_then(|id| id.parse::<u64>().ok())
+        .or_else(|| {
+            link.value()
+                .attr("href")
+                .and_then(extract_topic_id_from_href)
+        })
+}
+
+fn extract_topic_id_from_href(href: &str) -> Option<u64> {
+    capture_u64(href, r"[?&]t=(\d+)")
+}
+
+fn extract_forum_id_from_href(href: &str) -> Option<u64> {
+    capture_u64(href, r"[?&]f=(\d+)")
+}
+
+fn capture_u64(value: &str, pattern: &str) -> Option<u64> {
+    Regex::new(pattern)
+        .ok()?
+        .captures(value)?
+        .get(1)?
+        .as_str()
+        .parse::<u64>()
+        .ok()
+}
+
+fn extract_author(row: ElementRef<'_>) -> Option<String> {
+    row.select(&selector(
+        ".u-name a, td.u-name a, a[href*=\"profile.php?mode=viewprofile\"]",
+    ))
+    .next()
+    .map(text)
+    .filter(|value| !value.is_empty())
+}
+
+fn extract_size_from_row(row: ElementRef<'_>) -> u64 {
+    row.select(&selector("td.tor-size, td[data-ts_text]"))
+        .find_map(|td| {
+            td.value()
+                .attr("data-ts_text")
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| parse_size(&text(td)))
+        })
+        .unwrap_or(0)
+}
+
+fn extract_seed_count(row: ElementRef<'_>) -> i64 {
+    row.select(&selector("td.seedmed b, b.seedmed, .seedmed"))
+        .next()
+        .and_then(|el| text(el).replace(',', "").parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn extract_download_count(row: ElementRef<'_>) -> u64 {
+    row.select(&selector("td.dl-stub, td.tCenter"))
+        .filter_map(|td| text(td).replace(',', "").parse::<u64>().ok())
+        .last()
+        .unwrap_or(0)
+}
+
+pub fn parse_topic(html: &str, topic_id: u64, base_url: &Url) -> Result<TopicDetails> {
+    parse_topic_page(html, topic_id, 1, base_url)
+}
+
+pub fn parse_topic_page(
+    html: &str,
+    topic_id: u64,
+    comments_page: u32,
+    base_url: &Url,
+) -> Result<TopicDetails> {
+    let doc = Html::parse_document(html);
+    let first_visible_post = doc
+        .select(&selector(".post_wrap, .post, table.forumline tr"))
+        .find(|post| {
+            post.select(&selector(".post_body, td.message"))
+                .next()
+                .is_some()
+        });
+    let topic_post = if comments_page == 1 {
+        first_visible_post
+    } else {
+        None
+    };
+
+    let title = doc
+        .select(&selector("h1.maintitle, h1#topic-title, title"))
+        .next()
+        .map(text)
+        .map(|value| {
+            value
+                .split("::")
+                .next()
+                .unwrap_or(&value)
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    let category_path = doc
+        .select(&selector("table.navTitle a[href*=\"viewforum.php?f=\"], td.nav a[href*=\"viewforum.php?f=\"], a[href*=\"viewforum.php?f=\"]"))
+        .filter_map(|link| {
+            let id = link.value().attr("href").and_then(extract_forum_id_from_href)?;
+            let name = text(link);
+            (!name.is_empty()).then_some(CategoryRef { id, name })
+        })
+        .collect::<Vec<_>>();
+
+    let author = topic_post.and_then(|post| parse_author_from_post(post, base_url));
+    let description_body =
+        topic_post.and_then(|post| post.select(&selector(".post_body, td.message")).next());
+
+    let description_html = description_body
+        .map(|body| body.inner_html())
+        .unwrap_or_default();
+    let description_text = description_body.map(text).unwrap_or_default();
+    let first_post_images = description_body
+        .map(|body| image_urls(body, base_url))
+        .unwrap_or_default();
+    let first_post_files = description_body
+        .map(parse_first_post_files)
+        .unwrap_or_default();
+
+    let magnet = doc
+        .select(&selector("a[href^=\"magnet:\"]"))
+        .find_map(|a| a.value().attr("href").map(str::to_string));
+    let total_size_bytes = extract_topic_size(&doc);
+    let seeds = doc
+        .select(&selector("#tor-seed-count, .seedmed"))
+        .next()
+        .and_then(|el| text(el).parse::<i64>().ok());
+    let downloads = doc
+        .select(&selector("#tor-completed, .dl-stub"))
+        .next()
+        .and_then(|el| text(el).replace(',', "").parse::<u64>().ok());
+    let comments = parse_comments_from_doc(&doc, base_url, comments_page == 1);
+    let comments_total_pages = extract_topic_total_pages(&doc)
+        .unwrap_or(comments_page)
+        .max(comments_page)
+        .max(1);
+
+    Ok(TopicDetails {
+        topic_id,
+        title,
+        author,
+        category_path,
+        total_size_bytes,
+        seeds,
+        downloads,
+        magnet,
+        description_text,
+        description_html,
+        first_post_images,
+        first_post_files,
+        comments,
+        comments_page,
+        comments_total_pages,
+    })
+}
+
+fn parse_first_post_files(body: ElementRef<'_>) -> Vec<TopicFile> {
+    let mut files = Vec::new();
+    for block in body.select(&selector("pre, code, .sp-body, .filelist, .post_body")) {
+        for text_node in block.text() {
+            for line in text_node.lines() {
+                if let Some(file) = parse_file_line(line) {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        for line in text(body).lines() {
+            if let Some(file) = parse_file_line(line) {
+                files.push(file);
+            }
+        }
+    }
+    dedupe_files(files)
+}
+
+fn parse_file_line(line: &str) -> Option<TopicFile> {
+    let line = html_escape::decode_html_entities(line).trim().to_string();
+    if line.is_empty() || line.len() > 500 {
+        return None;
+    }
+    let line = line
+        .trim_start_matches([' ', '\t', '-', '*', '•', '|', '+'])
+        .trim()
+        .to_string();
+    let lowered = line.to_ascii_lowercase();
+    if lowered.starts_with("http://")
+        || lowered.starts_with("https://")
+        || lowered.starts_with("magnet:")
+        || lowered.contains("rutracker.org")
+    {
+        return None;
+    }
+    let file_ext = Regex::new(r"(?i)\.[a-z0-9]{1,8}(?:\s|$|\t| - | \(|\[)").ok()?;
+    if !file_ext.is_match(&line) {
+        return None;
+    }
+    let size = parse_size(&line);
+    let path = if let Some(size_match) = Regex::new(
+        r"(?i)\s*[-–—]?\s*\(?\d+(?:[\s.,]\d+)*\s*(?:b|б|kb|кб|kib|mb|мб|mib|gb|гб|gib|tb|тб|tib)\)?\s*$",
+    )
+    .ok()
+    .and_then(|re| re.find(&line))
+    {
+        line[..size_match.start()].trim().to_string()
+    } else {
+        line.trim().to_string()
+    };
+    let path = path
+        .trim_matches(['"', '\''])
+        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')' || ch == ' ')
+        .trim()
+        .to_string();
+    (!path.is_empty()).then_some(TopicFile {
+        path,
+        size_bytes: size,
+    })
+}
+
+fn dedupe_files(files: Vec<TopicFile>) -> Vec<TopicFile> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for file in files {
+        let key = file.path.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(file);
+        }
+    }
+    out
+}
+
+fn parse_author_from_post(post: ElementRef<'_>, base_url: &Url) -> Option<AuthorDetails> {
+    let name = post
+        .select(&selector(
+            ".nick a, .nick, .poster_info a, .post-author a, p.nick a",
+        ))
+        .next()
+        .map(text)
+        .filter(|value| !value.is_empty())?;
+    let posts_count = post
+        .select(&selector(
+            ".poster_info, .joined, .post-author-details, td.row1",
+        ))
+        .map(text)
+        .find_map(|value| {
+            Regex::new(r"(?i)(?:сообщ|posts?|messages?)\D+([\d\s,]+)")
+                .ok()?
+                .captures(&value)?
+                .get(1)?
+                .as_str()
+                .replace([' ', ','], "")
+                .parse::<u64>()
+                .ok()
+        });
+    let avatar_url = post
+        .select(&selector("img.avatar, .poster_info img, td.row1 img"))
+        .find_map(|img| {
+            img.value()
+                .attr("src")
+                .and_then(|src| attr_url(base_url, src))
+        });
+
+    Some(AuthorDetails {
+        name,
+        posts_count,
+        avatar_url,
+    })
+}
+
+fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for img in body.select(&selector("img")) {
+        let Some(src) = img.value().attr("src") else {
+            continue;
+        };
+        let Some(url) = attr_url(base_url, src) else {
+            continue;
+        };
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+fn parse_comments_from_doc(doc: &Html, base_url: &Url, skip_first_post: bool) -> Vec<TopicComment> {
+    let mut comments = Vec::new();
+    for (index, post) in doc
+        .select(&selector(".post_wrap, .post, table.forumline tr"))
+        .filter(|post| {
+            post.select(&selector(".post_body, td.message"))
+                .next()
+                .is_some()
+        })
+        .enumerate()
+    {
+        if skip_first_post && index == 0 {
+            continue;
+        }
+        let text = post
+            .select(&selector(".post_body, td.message"))
+            .next()
+            .map(text)
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        comments.push(TopicComment {
+            author: parse_author_from_post(post, base_url),
+            text,
+        });
+        if comments.len() >= 10 {
+            break;
+        }
+    }
+    comments
+}
+
+fn extract_topic_total_pages(doc: &Html) -> Option<u32> {
+    doc.select(&selector("a[href*=\"start=\"]"))
+        .filter_map(|link| {
+            let start = link
+                .value()
+                .attr("href")
+                .and_then(|href| capture_u64(href, r"[?&]start=(\d+)"))?;
+            Some((start / 30 + 1) as u32)
+        })
+        .max()
+        .or_else(|| {
+            doc.select(&selector(".pg a, .pagination a"))
+                .filter_map(|link| text(link).parse::<u32>().ok())
+                .max()
+        })
+}
+
+fn extract_topic_size(doc: &Html) -> Option<u64> {
+    doc.select(&selector("#tor-size-humn, span.tor-size, .tor-size"))
+        .find_map(|el| {
+            el.value()
+                .attr("title")
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| parse_size(&text(el)))
+        })
+        .or_else(|| {
+            doc.select(&selector("li, td"))
+                .find_map(|el| parse_size(&text(el)))
+        })
+}
+
+pub fn parse_forum_nodes(html: &str) -> Vec<ForumNode> {
+    let doc = Html::parse_document(html);
+    let mut nodes = Vec::new();
+    for link in doc.select(&selector("a[href*=\"viewforum.php?f=\"]")) {
+        let Some(id) = link
+            .value()
+            .attr("href")
+            .and_then(extract_forum_id_from_href)
+        else {
+            continue;
+        };
+        let name = text(link);
+        if name.is_empty() {
+            continue;
+        }
+        nodes.push(ForumNode {
+            id,
+            name,
+            parent_id: None,
+        });
+    }
+    dedupe_forums(nodes).unwrap_or_default()
+}
+
+fn dedupe_forums(nodes: Vec<ForumNode>) -> Result<Vec<ForumNode>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for node in nodes {
+        if seen.insert(node.id) {
+            out.push(node);
+        }
+    }
+    Ok(out)
+}
+
+pub fn parse_size(value: &str) -> Option<u64> {
+    let cleaned = value
+        .replace("&nbsp;", " ")
+        .replace('\u{a0}', " ")
+        .trim()
+        .to_string();
+    let re = Regex::new(r"(?i)(\d+(?:[\s.,]\d+)*)\s*(b|б|kb|кб|kib|mb|мб|mib|gb|гб|gib|tb|тб|tib)")
+        .ok()?;
+    let captures = re.captures(&cleaned)?;
+    let number_raw = captures.get(1)?.as_str();
+    let unit = captures.get(2)?.as_str().to_ascii_uppercase();
+    let decimal_separator = number_raw.chars().rev().find(|ch| *ch == '.' || *ch == ',');
+    let mut number = String::new();
+    for ch in number_raw.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+        } else if Some(ch) == decimal_separator {
+            number.push('.');
+        }
+    }
+    let amount = number.parse::<f64>().ok()?;
+    let multiplier = match unit.as_str() {
+        "B" | "Б" => 1.0,
+        "KB" | "КБ" | "KIB" => 1024.0,
+        "MB" | "МБ" | "MIB" => 1024.0 * 1024.0,
+        "GB" | "ГБ" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "TB" | "ТБ" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let bytes = amount * multiplier;
+    if !bytes.is_finite() || bytes < 0.0 || bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
+}
+
+pub fn require_magnet(topic: &TopicDetails) -> Result<&str> {
+    topic
+        .magnet
+        .as_deref()
+        .ok_or_else(|| anyhow!("RuTracker topic does not expose a magnet link in HTML"))
+}
+
+pub fn ensure_same_topic(result: &SearchResult, details: &TopicDetails) {
+    if details.title.is_empty() {
+        warn!(
+            topic_id = result.topic_id,
+            "topic details did not expose title"
+        );
+    }
+}
+
+pub fn validate_forum_query(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        bail!("category search query is empty");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Url {
+        Url::parse("https://rutracker.org/forum/").unwrap()
+    }
+
+    #[test]
+    fn parses_size_labels() {
+        assert_eq!(parse_size("49.5 MB"), Some(51_904_512));
+        assert_eq!(parse_size("1,5 ГБ"), Some(1_610_612_736));
+        assert_eq!(parse_size("1 234,5 KB"), Some(1_264_128));
+    }
+
+    #[test]
+    fn builds_all_time_title_search_form() {
+        let fields = search_form_fields("meanna", Some(123));
+        let encoded = String::from_utf8(cp1251_form(&fields)).unwrap();
+        assert_eq!(encoded, "nm=meanna&max=1&tm=-1&o=10&s=2&f=123");
+    }
+
+    #[test]
+    fn parses_search_fixture() {
+        let html = include_str!("../tests/fixtures/rutracker/search.html");
+        let results = parse_search_results(html, &base()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].topic_id, 6849001);
+        assert_eq!(results[0].title, "Legal Indie Album - 2026 [FLAC]");
+        assert_eq!(results[0].category.as_ref().unwrap().id, 123);
+        assert_eq!(results[0].size_bytes, 41_943_040);
+        assert_eq!(results[0].seeds, 17);
+        assert_eq!(results[0].downloads, 420);
+    }
+
+    #[test]
+    fn parses_topic_fixture() {
+        let html = include_str!("../tests/fixtures/rutracker/topic.html");
+        let topic = parse_topic(html, 6849001, &base()).unwrap();
+        assert_eq!(topic.title, "Legal Indie Album - 2026 [FLAC]");
+        assert_eq!(topic.author.as_ref().unwrap().name, "artist");
+        assert_eq!(topic.author.as_ref().unwrap().posts_count, Some(321));
+        assert!(
+            topic
+                .author
+                .as_ref()
+                .unwrap()
+                .avatar_url
+                .as_ref()
+                .unwrap()
+                .contains("avatar.jpg")
+        );
+        assert_eq!(topic.first_post_images.len(), 2);
+        assert_eq!(topic.first_post_files.len(), 3);
+        assert_eq!(topic.first_post_files[0].size_bytes, Some(31_457_280));
+        assert!(
+            topic
+                .magnet
+                .as_ref()
+                .unwrap()
+                .starts_with("magnet:?xt=urn:btih:")
+        );
+        assert_eq!(topic.comments.len(), 2);
+        assert_eq!(topic.comments_page, 1);
+        assert_eq!(topic.comments_total_pages, 6);
+    }
+
+    #[test]
+    fn parses_forum_nodes_fixture() {
+        let html = include_str!("../tests/fixtures/rutracker/categories.html");
+        let nodes = parse_forum_nodes(html);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].id, 123);
+        assert_eq!(nodes[0].name, "Indie Music");
+    }
+}
