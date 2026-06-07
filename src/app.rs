@@ -28,8 +28,8 @@ const HELP_TEXT: &str = concat!(
     "This is an unofficial bot and is not affiliated with RuTracker.\n\n",
     "Send a RuTracker search string. I search rutracker.org titles and return matching topics.\n\n",
     "Use <code>c text</code> to search categories. Category buttons from normal search results rerun the same query inside that category.\n\n",
-    "Downloads are limited to files under 50 MB because Telegram Bot API has that upload limit: ",
-    "https://core.telegram.org/bots/api#senddocument\n\n",
+    "Downloads are limited to files under 50 MB because Telegram Bot API ",
+    "<a href=\"https://core.telegram.org/bots/api#senddocument\">sendDocument</a> has that upload limit.\n\n",
     "Torrent downloads use librqbit, the rqbit torrent client library: ",
     "https://github.com/ikatson/rqbit\n\n",
     "AWS Lambda can run one invocation for at most 15 minutes: ",
@@ -1770,6 +1770,9 @@ mod tests {
     #[test]
     fn help_mentions_limits_unofficial_status_and_donations() {
         assert!(HELP_TEXT.contains("https://github.com/ikatson/rqbit"));
+        assert!(HELP_TEXT.contains(
+            "<a href=\"https://core.telegram.org/bots/api#senddocument\">sendDocument</a>"
+        ));
         assert!(
             HELP_TEXT.contains(
                 "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html"
