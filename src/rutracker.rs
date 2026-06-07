@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::WINDOWS_1251;
 use regex::Regex;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
-use scraper::{ElementRef, Html, Selector};
+use scraper::{ElementRef, Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -530,6 +530,112 @@ fn text(el: ElementRef<'_>) -> String {
     .to_string()
 }
 
+fn description_text(body: ElementRef<'_>) -> String {
+    let mut out = String::new();
+    for node in body.descendants() {
+        match node.value() {
+            Node::Text(value) => {
+                let in_pre = node
+                    .ancestors()
+                    .filter_map(ElementRef::wrap)
+                    .any(|element| matches!(element.value().name(), "pre" | "code"));
+                if in_pre {
+                    push_pre_description_text(&mut out, value);
+                } else {
+                    push_inline_description_text(&mut out, value);
+                }
+            }
+            Node::Element(element)
+                if element.name() == "br" || is_description_block(element.name()) =>
+            {
+                push_description_newline(&mut out);
+            }
+            _ => {}
+        }
+    }
+    normalize_description_text(&out)
+}
+
+fn is_description_block(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "dd"
+            | "details"
+            | "div"
+            | "dl"
+            | "dt"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "tbody"
+            | "td"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
+fn push_inline_description_text(out: &mut String, value: &str) {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with(|ch: char| ch.is_whitespace()) {
+        out.push(' ');
+    }
+    out.push_str(&text);
+}
+
+fn push_pre_description_text(out: &mut String, value: &str) {
+    for line in value.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            continue;
+        }
+        push_description_newline(out);
+        out.push_str(&line);
+    }
+}
+
+fn push_description_newline(out: &mut String) {
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn normalize_description_text(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| line.trim().replace(" :", ":"))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn attr_url(base_url: &Url, value: &str) -> Option<String> {
     if value.starts_with("data:") {
         return None;
@@ -766,7 +872,7 @@ pub fn parse_topic_page(
     let description_html = description_body
         .map(|body| body.inner_html())
         .unwrap_or_default();
-    let description_text = description_body.map(text).unwrap_or_default();
+    let description_text = description_body.map(description_text).unwrap_or_default();
     let release_type = extract_release_type(&description_text);
     let first_post_images = description_body
         .map(|body| image_urls(body, base_url))
@@ -1276,6 +1382,14 @@ mod tests {
         assert_eq!(topic.release_type.as_deref(), Some("авторская"));
         assert_eq!(topic.publication_date.as_deref(), Some("07-Jun-26 12:34"));
         assert_eq!(topic.downloads, Some(295));
+        assert!(topic.description_text.contains(
+            "Тип: авторская\nReleased by the author under a permissive license.\n.torrent скачан: 295 раз"
+        ));
+        assert!(
+            topic
+                .description_text
+                .contains("01 - First Track.flac - 30 MB\n02 - Second Track.flac - 9 MB")
+        );
         assert!(
             topic
                 .author

@@ -25,6 +25,7 @@ pub struct Message {
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
+    pub reply_markup: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

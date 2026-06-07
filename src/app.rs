@@ -244,6 +244,10 @@ impl App {
             chat_id: message.chat.id,
             message_id: message.message_id,
         });
+        let callback_reply_markup = callback
+            .message
+            .as_ref()
+            .and_then(|message| message.reply_markup.clone());
 
         if let Some(topic_id) = data.strip_prefix("dl:").and_then(parse_u64) {
             self.telegram
@@ -294,7 +298,7 @@ impl App {
                 .answer_callback(&callback.id, "Loading description...")
                 .await?;
             return self
-                .handle_description(chat_id, topic_id, callback_message)
+                .handle_description(chat_id, topic_id, callback_message, callback_reply_markup)
                 .await;
         }
         if let Some(topic_id) = data.strip_prefix("files:").and_then(parse_u64) {
@@ -471,11 +475,13 @@ impl App {
     }
 
     async fn run_search(&self, chat_id: i64, query: &str, forum_id: Option<u64>) -> Result<()> {
+        self.try_send_typing(chat_id).await;
         let _typing = self.telegram.start_chat_action_heartbeat(chat_id, "typing");
         let progress = self
             .telegram
             .send_status_message(chat_id, "Searching RuTracker...")
             .await?;
+        self.try_send_typing(chat_id).await;
         let results = match self.cached_search(query, forum_id).await {
             Ok(results) => results,
             Err(err) => {
@@ -506,6 +512,12 @@ impl App {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn try_send_typing(&self, chat_id: i64) {
+        if let Err(err) = self.telegram.send_chat_action(chat_id, "typing").await {
+            warn!(chat_id, error = %err, "failed to send Telegram typing action");
+        }
     }
 
     async fn send_search_result(
@@ -689,6 +701,7 @@ impl App {
         chat_id: i64,
         topic_id: u64,
         progress: Option<ProgressMessage>,
+        reply_markup: Option<Value>,
     ) -> Result<()> {
         let topic = match self.cached_topic(topic_id).await {
             Ok(topic) => topic,
@@ -702,16 +715,17 @@ impl App {
             }
         };
         let text = if topic.description_text.is_empty() {
-            "Description is empty or unavailable.".to_string()
+            self.topic_message_with_description(&topic, "Description is empty or unavailable.")?
         } else {
-            format!(
-                "<b>{}</b>\n\n{}",
-                html_escape(&topic.title),
-                html_escape(&truncate_for_telegram(&topic.description_text, 3500))
-            )
+            self.topic_message_with_description(
+                &topic,
+                &html_escape(&truncate_for_telegram(&topic.description_text, 3000)),
+            )?
         };
         if let Some(progress) = progress {
-            self.telegram.edit_message(progress, &text, None).await?;
+            self.telegram
+                .edit_message(progress, &text, reply_markup)
+                .await?;
         } else {
             self.telegram.send_message(chat_id, &text, None).await?;
         }
@@ -732,6 +746,61 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn topic_message_with_description(
+        &self,
+        topic: &TopicDetails,
+        description: &str,
+    ) -> Result<String> {
+        let title = if topic.title.is_empty() {
+            "RuTracker topic"
+        } else {
+            &topic.title
+        };
+        let category_line = match topic.category_path.last() {
+            Some(category) => format!(
+                "<a href=\"{}\">{}</a>",
+                html_escape(&self.rutracker.category_url(category.id)?),
+                html_escape(&category.name)
+            ),
+            None => "unknown".to_string(),
+        };
+        let metadata_lines = format_topic_metadata_lines(topic);
+        let metadata_block = if metadata_lines.is_empty() {
+            String::new()
+        } else {
+            format!("{metadata_lines}\n")
+        };
+        let author = topic
+            .author
+            .as_ref()
+            .map(format_author)
+            .unwrap_or_else(|| "unknown".to_string());
+        let size = topic
+            .total_size_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unknown".to_string());
+        let seeds = topic
+            .seeds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let downloads = topic
+            .downloads
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Ok(format!(
+            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}\n\n<b>Description</b>\n{}",
+            topic_title_link(title, &self.rutracker.topic_url(topic.topic_id)?),
+            category_line,
+            metadata_block,
+            author,
+            size,
+            seeds,
+            downloads,
+            description
+        ))
     }
 
     async fn handle_files(&self, chat_id: i64, topic_id: u64) -> Result<()> {
