@@ -21,6 +21,8 @@ pub struct Config {
     pub allowed_telegram_user_ids: HashSet<i64>,
     pub rutracker_base_urls: Vec<String>,
     pub rutracker_cookie: Option<String>,
+    pub rutracker_username: Option<String>,
+    pub rutracker_password: Option<String>,
     pub search_limit: usize,
     pub http_timeout_seconds: u64,
     pub tmp_dir: PathBuf,
@@ -32,12 +34,19 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let (rutracker_username, rutracker_password) = parse_rutracker_credentials(
+            optional_env("RUTRACKER_USERNAME"),
+            optional_env("RUTRACKER_PASSWORD"),
+        )?;
+
         Ok(Self {
             telegram_bot_token: required_env("TELEGRAM_BOT_TOKEN")?,
             telegram_webhook_secret: required_env("TELEGRAM_WEBHOOK_SECRET")?,
             allowed_telegram_user_ids: parse_allowed_telegram_user_ids()?,
             rutracker_base_urls: parse_rutracker_base_urls()?,
             rutracker_cookie: optional_env("RUTRACKER_COOKIE"),
+            rutracker_username,
+            rutracker_password,
             search_limit: parse_env("SEARCH_LIMIT", DEFAULT_SEARCH_LIMIT)?.clamp(1, 20),
             http_timeout_seconds: parse_env(
                 "RUTRACKER_HTTP_TIMEOUT_SECONDS",
@@ -128,6 +137,18 @@ pub fn parse_rutracker_base_url_list(value: Option<&str>) -> Result<Vec<String>>
     Ok(urls)
 }
 
+pub fn parse_rutracker_credentials(
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    match (username, password) {
+        (Some(username), Some(password)) => Ok((Some(username), Some(password))),
+        (None, None) => Ok((None, None)),
+        (Some(_), None) => bail!("RUTRACKER_PASSWORD is required when RUTRACKER_USERNAME is set"),
+        (None, Some(_)) => bail!("RUTRACKER_USERNAME is required when RUTRACKER_PASSWORD is set"),
+    }
+}
+
 pub fn parse_telegram_user_id_set(value: Option<&str>) -> Result<HashSet<i64>> {
     let Some(value) = value else {
         return Ok(HashSet::new());
@@ -153,7 +174,9 @@ pub fn parse_telegram_user_id_set(value: Option<&str>) -> Result<HashSet<i64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rutracker_base_url_list, parse_telegram_user_id_set};
+    use super::{
+        parse_rutracker_base_url_list, parse_rutracker_credentials, parse_telegram_user_id_set,
+    };
 
     #[test]
     fn parses_allowed_user_ids() {
@@ -180,6 +203,19 @@ mod tests {
                 "https://rutracker.org/forum".to_string(),
                 "https://rutracker.net/forum".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn parses_rutracker_credentials_only_when_complete() {
+        let parsed =
+            parse_rutracker_credentials(Some("alice".to_string()), Some("pw".to_string())).unwrap();
+        assert_eq!(parsed, (Some("alice".to_string()), Some("pw".to_string())));
+        assert!(parse_rutracker_credentials(Some("alice".to_string()), None).is_err());
+        assert!(parse_rutracker_credentials(None, Some("pw".to_string())).is_err());
+        assert_eq!(
+            parse_rutracker_credentials(None, None).unwrap(),
+            (None, None)
         );
     }
 }

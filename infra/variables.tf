@@ -52,7 +52,21 @@ variable "rutracker_base_urls" {
 }
 
 variable "rutracker_cookie" {
-  description = "Optional RuTracker cookie. The bot does not require it for public HTML and magnet links."
+  description = "Optional RuTracker cookie fallback. Prefer rutracker_username/rutracker_password for authenticated search."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "rutracker_username" {
+  description = "Optional RuTracker username for authenticated search."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "rutracker_password" {
+  description = "Optional RuTracker password for authenticated search."
   type        = string
   default     = ""
   sensitive   = true

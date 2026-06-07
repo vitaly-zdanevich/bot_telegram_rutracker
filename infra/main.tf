@@ -28,6 +28,12 @@ locals {
     },
     var.rutracker_cookie == "" ? {} : {
       RUTRACKER_COOKIE = var.rutracker_cookie
+    },
+    var.rutracker_username == "" ? {} : {
+      RUTRACKER_USERNAME = var.rutracker_username
+    },
+    var.rutracker_password == "" ? {} : {
+      RUTRACKER_PASSWORD = var.rutracker_password
     }
   )
 }

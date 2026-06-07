@@ -85,7 +85,8 @@ Environment variables:
 - `ALLOWED_TELEGRAM_USER_IDS`, comma-separated; empty means public
 - `RUTRACKER_BASE_URLS`, comma-separated forum base URLs tried in order; default `https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum`
 - `RUTRACKER_BASE_URL`, backward-compatible single URL fallback when `RUTRACKER_BASE_URLS` is not set
-- `RUTRACKER_COOKIE`, optional
+- `RUTRACKER_USERNAME` and `RUTRACKER_PASSWORD`, optional authenticated search credentials
+- `RUTRACKER_COOKIE`, optional fallback; credentials are preferred
 - `SEARCH_LIMIT`, default `10`
 - `MAX_FILE_MB`, default `50`
 - `LAMBDA_TIMEOUT_SECONDS`, default `900`

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,13 +8,35 @@ use regex::Regex;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 #[derive(Clone)]
 pub struct RutrackerClient {
     http: reqwest::Client,
     base_urls: Vec<Url>,
+    credentials: Option<RutrackerCredentials>,
+    logged_in_base_urls: Arc<Mutex<HashSet<String>>>,
+}
+
+#[derive(Clone)]
+pub struct RutrackerCredentials {
+    username: String,
+    password: String,
+}
+
+impl RutrackerCredentials {
+    pub fn new(username: &str, password: &str) -> Result<Self> {
+        let username = username.trim();
+        let password = password.trim();
+        if username.is_empty() || password.is_empty() {
+            bail!("RUTRACKER_USERNAME and RUTRACKER_PASSWORD must not be empty");
+        }
+        Ok(Self {
+            username: username.to_string(),
+            password: password.to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -81,9 +104,17 @@ pub struct ForumNode {
 }
 
 impl RutrackerClient {
-    pub fn new(base_urls: &[String], cookie: Option<&str>, timeout_seconds: u64) -> Result<Self> {
+    pub fn new(
+        base_urls: &[String],
+        cookie: Option<&str>,
+        credentials: Option<RutrackerCredentials>,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        if let Some(cookie) = cookie {
+        if credentials.is_some() && cookie.is_some() {
+            warn!("RUTRACKER_COOKIE ignored because RuTracker credentials are configured");
+        }
+        if let Some(cookie) = cookie.filter(|_| credentials.is_none()) {
             headers.insert(
                 COOKIE,
                 HeaderValue::from_str(cookie).context("RUTRACKER_COOKIE is not a valid header")?,
@@ -93,6 +124,7 @@ impl RutrackerClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .default_headers(headers)
+            .cookie_store(credentials.is_some())
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
@@ -117,7 +149,12 @@ impl RutrackerClient {
             bail!("RUTRACKER_BASE_URLS must contain at least one URL");
         }
 
-        Ok(Self { http, base_urls })
+        Ok(Self {
+            http,
+            base_urls,
+            credentials,
+            logged_in_base_urls: Arc::new(Mutex::new(HashSet::new())),
+        })
     }
 
     pub async fn search(
@@ -215,6 +252,12 @@ impl RutrackerClient {
         let mut last_error = None;
 
         for base_url in &self.base_urls {
+            if let Err(err) = self.ensure_logged_in(base_url).await {
+                warn!(base_url = %base_url, error = %err, "RuTracker login failed");
+                last_error = Some(err);
+                continue;
+            }
+
             let mut url = forum_url_for(base_url, path)?;
             configure_url(&mut url);
 
@@ -251,6 +294,12 @@ impl RutrackerClient {
         let mut last_error = None;
 
         for base_url in &self.base_urls {
+            if let Err(err) = self.ensure_logged_in(base_url).await {
+                warn!(base_url = %base_url, error = %err, "RuTracker login failed");
+                last_error = Some(err);
+                continue;
+            }
+
             let url = forum_url_for(base_url, path)?;
 
             match self
@@ -283,6 +332,57 @@ impl RutrackerClient {
 
         Err(last_error.unwrap_or_else(|| anyhow!("no RuTracker base URLs configured")))
     }
+
+    async fn ensure_logged_in(&self, base_url: &Url) -> Result<()> {
+        let Some(credentials) = self.credentials.clone() else {
+            return Ok(());
+        };
+        let key = base_url.as_str().trim_end_matches('/').to_string();
+        if self.logged_in_base_urls()?.contains(&key) {
+            return Ok(());
+        }
+
+        self.login_to_base(base_url, &credentials).await?;
+        self.logged_in_base_urls()?.insert(key);
+        Ok(())
+    }
+
+    fn logged_in_base_urls(&self) -> Result<std::sync::MutexGuard<'_, HashSet<String>>> {
+        self.logged_in_base_urls
+            .lock()
+            .map_err(|_| anyhow!("RuTracker login state lock is poisoned"))
+    }
+
+    async fn login_to_base(
+        &self,
+        base_url: &Url,
+        credentials: &RutrackerCredentials,
+    ) -> Result<()> {
+        let url = forum_url_for(base_url, "login.php")?;
+        let fields = login_form_fields(&credentials.username, &credentials.password);
+        let response = self
+            .http
+            .post(url.clone())
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(cp1251_form(&fields))
+            .send()
+            .await
+            .with_context(|| format!("RuTracker login request failed for {base_url}"))?;
+        let status = response.status();
+        let final_url = response.url().clone();
+        let html = decode_response(response).await?;
+
+        if login_succeeded(&html) {
+            info!(base_url = %base_url, "RuTracker login succeeded");
+            return Ok(());
+        }
+
+        if html_contains_login_form(&html) {
+            bail!("RuTracker login failed; check RUTRACKER_USERNAME and RUTRACKER_PASSWORD");
+        }
+
+        bail!("RuTracker login failed with status {status} at {final_url}");
+    }
 }
 
 fn forum_url_for(base_url: &Url, path: &str) -> Result<Url> {
@@ -305,6 +405,14 @@ fn search_form_fields(query: &str, forum_id: Option<u64>) -> Vec<(&'static str, 
     fields
 }
 
+fn login_form_fields(username: &str, password: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("login_username", username.to_string()),
+        ("login_password", password.to_string()),
+        ("login", "Вход".to_string()),
+    ]
+}
+
 async fn decode_response(response: reqwest::Response) -> Result<String> {
     let bytes = response.bytes().await?;
     let (decoded, _, _) = WINDOWS_1251.decode(&bytes);
@@ -313,6 +421,23 @@ async fn decode_response(response: reqwest::Response) -> Result<String> {
 
 fn selector(value: &str) -> Selector {
     Selector::parse(value).expect("static selector is valid")
+}
+
+fn html_contains_login_form(html: &str) -> bool {
+    let doc = Html::parse_document(html);
+    doc_contains_login_form(&doc)
+}
+
+fn doc_contains_login_form(doc: &Html) -> bool {
+    doc.select(&selector(
+        "form#login-form-full, form[action*=\"login.php\"], input[name=\"login_username\"]",
+    ))
+    .next()
+    .is_some()
+}
+
+fn login_succeeded(html: &str) -> bool {
+    html.contains("logged-in-username") || html.contains("logged-in-as-uname")
 }
 
 fn text(el: ElementRef<'_>) -> String {
@@ -368,6 +493,10 @@ fn percent_form_encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 
 pub fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<SearchResult>> {
     let doc = Html::parse_document(html);
+    if doc_contains_login_form(&doc) {
+        bail!("RuTracker returned the login form instead of search results");
+    }
+
     let mut results = Vec::new();
 
     for row in doc.select(&selector("#tor-tbl tbody tr, tr.hl-tr, tr.tCenter")) {
@@ -903,6 +1032,27 @@ mod tests {
     }
 
     #[test]
+    fn builds_cp1251_login_form() {
+        let fields = login_form_fields("alice", "secret");
+        let encoded = String::from_utf8(cp1251_form(&fields)).unwrap();
+        assert_eq!(
+            encoded,
+            "login_username=alice&login_password=secret&login=%C2%F5%EE%E4"
+        );
+    }
+
+    #[test]
+    fn detects_login_success_markers() {
+        assert!(login_succeeded(
+            r#"<span id="logged-in-username">alice</span>"#
+        ));
+        assert!(login_succeeded(
+            r#"<a class="logged-in-as-uname">alice</a>"#
+        ));
+        assert!(!login_succeeded("<form action=\"login.php\"></form>"));
+    }
+
+    #[test]
     fn parses_search_fixture() {
         let html = include_str!("../tests/fixtures/rutracker/search.html");
         let results = parse_search_results(html, &base()).unwrap();
@@ -913,6 +1063,16 @@ mod tests {
         assert_eq!(results[0].size_bytes, 41_943_040);
         assert_eq!(results[0].seeds, 17);
         assert_eq!(results[0].downloads, 420);
+    }
+
+    #[test]
+    fn rejects_search_login_form_fixture() {
+        let html = include_str!("../tests/fixtures/rutracker/search_login.html");
+        let err = parse_search_results(html, &base()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("returned the login form instead of search results")
+        );
     }
 
     #[test]

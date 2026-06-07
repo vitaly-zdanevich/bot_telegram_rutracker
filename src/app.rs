@@ -14,8 +14,8 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::downloader::{DownloadRequest, TorrentDownloader};
 use crate::rutracker::{
-    AuthorDetails, RutrackerClient, SearchResult, TopicDetails, TopicFile, ensure_same_topic,
-    require_magnet, validate_forum_query,
+    AuthorDetails, RutrackerClient, RutrackerCredentials, SearchResult, TopicDetails, TopicFile,
+    ensure_same_topic, require_magnet, validate_forum_query,
 };
 use crate::telegram::{
     CallbackQuery, InlineQuery, Message, ProgressMessage, Telegram, Update, callback_button,
@@ -138,9 +138,19 @@ struct App {
 impl App {
     fn new(config: Config) -> Result<Self> {
         let telegram = Telegram::new(config.telegram_bot_token.clone());
+        let rutracker_credentials = match (
+            config.rutracker_username.as_deref(),
+            config.rutracker_password.as_deref(),
+        ) {
+            (Some(username), Some(password)) => {
+                Some(RutrackerCredentials::new(username, password)?)
+            }
+            _ => None,
+        };
         let rutracker = RutrackerClient::new(
             &config.rutracker_base_urls,
             config.rutracker_cookie.as_deref(),
+            rutracker_credentials,
             config.http_timeout_seconds,
         )?;
         Ok(Self {
