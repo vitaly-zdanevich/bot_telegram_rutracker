@@ -66,6 +66,8 @@ pub struct TopicDetails {
     pub title: String,
     pub author: Option<AuthorDetails>,
     pub category_path: Vec<CategoryRef>,
+    pub release_type: Option<String>,
+    pub publication_date: Option<String>,
     pub total_size_bytes: Option<u64>,
     pub seeds: Option<i64>,
     pub downloads: Option<u64>,
@@ -749,12 +751,16 @@ pub fn parse_topic_page(
         .map(|body| body.inner_html())
         .unwrap_or_default();
     let description_text = description_body.map(text).unwrap_or_default();
+    let release_type = extract_release_type(&description_text);
     let first_post_images = description_body
         .map(|body| image_urls(body, base_url))
         .unwrap_or_default();
     let first_post_files = description_body
         .map(parse_first_post_files)
         .unwrap_or_default();
+    let publication_date = topic_post
+        .and_then(extract_publication_date_from_post)
+        .or_else(|| extract_publication_date_from_description(&description_text));
 
     let magnet = doc
         .select(&selector("a[href^=\"magnet:\"]"))
@@ -764,10 +770,7 @@ pub fn parse_topic_page(
         .select(&selector("#tor-seed-count, .seedmed"))
         .next()
         .and_then(|el| text(el).parse::<i64>().ok());
-    let downloads = doc
-        .select(&selector("#tor-completed, .dl-stub"))
-        .next()
-        .and_then(|el| text(el).replace(',', "").parse::<u64>().ok());
+    let downloads = extract_topic_downloads(&doc);
     let comments = parse_comments_from_doc(&doc, base_url, comments_page == 1);
     let comments_total_pages = extract_topic_total_pages(&doc)
         .unwrap_or(comments_page)
@@ -779,6 +782,8 @@ pub fn parse_topic_page(
         title,
         author,
         category_path,
+        release_type,
+        publication_date,
         total_size_bytes,
         seeds,
         downloads,
@@ -990,6 +995,72 @@ fn extract_topic_size(doc: &Html) -> Option<u64> {
         })
 }
 
+fn extract_topic_downloads(doc: &Html) -> Option<u64> {
+    doc.select(&selector("#tor-completed, .dl-stub"))
+        .find_map(|el| parse_human_u64(&text(el)))
+        .or_else(|| parse_torrent_downloads_from_text(&text(doc.root_element())))
+}
+
+fn parse_torrent_downloads_from_text(value: &str) -> Option<u64> {
+    let captures = Regex::new(r"(?i)(?:\.torrent\s*)?скачан\s*:\s*([\d\s,]+)\s*раз")
+        .ok()?
+        .captures(value)?;
+    parse_human_u64(captures.get(1)?.as_str())
+}
+
+fn extract_release_type(description_text: &str) -> Option<String> {
+    Regex::new(r"(?i)тип\s*:\s*авторская")
+        .ok()?
+        .is_match(description_text)
+        .then(|| "авторская".to_string())
+}
+
+fn extract_publication_date_from_post(post: ElementRef<'_>) -> Option<String> {
+    post.select(&selector(
+        ".post-time, .post_time, .post-date, .post_date, .posted, .post_head, .post-head, td.catHead, .gensmall",
+    ))
+    .find_map(|el| parse_publication_date_text(&text(el)))
+}
+
+fn extract_publication_date_from_description(description_text: &str) -> Option<String> {
+    let date = r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?|\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[-\s]\p{L}{3,}[-\s]\d{2,4}(?:\s+\d{1,2}:\d{2})?)";
+    let labeled_date = Regex::new(&format!(
+        r"(?i)(?:дата\s+(?:публикации|выхода|релиза)|опубликовано)\s*:?\s*{date}"
+    ))
+    .ok()?;
+    if let Some(value) = labeled_date
+        .captures(description_text)
+        .and_then(|captures| captures.get(1))
+        .map(|capture| capture.as_str().trim().to_string())
+    {
+        return Some(value);
+    }
+
+    Regex::new(r"(?i)год\s+выпуска\s*:?\s*(\d{4})")
+        .ok()?
+        .captures(description_text)
+        .and_then(|captures| captures.get(1))
+        .map(|capture| capture.as_str().to_string())
+}
+
+fn parse_publication_date_text(value: &str) -> Option<String> {
+    let date_patterns = [
+        r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?",
+        r"\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?",
+        r"\d{1,2}[-\s]\p{L}{3,}[-\s]\d{2,4}(?:\s+\d{1,2}:\d{2})?",
+    ];
+    date_patterns.iter().find_map(|pattern| {
+        Regex::new(pattern)
+            .ok()?
+            .find(value)
+            .map(|matched| matched.as_str().trim().to_string())
+    })
+}
+
+fn parse_human_u64(value: &str) -> Option<u64> {
+    value.replace([' ', ','], "").parse::<u64>().ok()
+}
+
 pub fn parse_forum_nodes(html: &str) -> Vec<ForumNode> {
     let doc = Html::parse_document(html);
     let mut nodes = Vec::new();
@@ -1157,6 +1228,9 @@ mod tests {
         assert_eq!(topic.title, "Legal Indie Album - 2026 [FLAC]");
         assert_eq!(topic.author.as_ref().unwrap().name, "artist");
         assert_eq!(topic.author.as_ref().unwrap().posts_count, Some(321));
+        assert_eq!(topic.release_type.as_deref(), Some("авторская"));
+        assert_eq!(topic.publication_date.as_deref(), Some("07-Jun-26 12:34"));
+        assert_eq!(topic.downloads, Some(295));
         assert!(
             topic
                 .author

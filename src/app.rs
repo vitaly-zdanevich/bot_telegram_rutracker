@@ -425,10 +425,16 @@ impl App {
             .map(format_author)
             .or_else(|| result.author.as_ref().map(|name| html_escape(name)))
             .unwrap_or_else(|| "unknown".to_string());
+        let metadata_lines = details
+            .map(format_topic_metadata_lines)
+            .filter(|lines| !lines.is_empty())
+            .map(|lines| format!("{lines}\n"))
+            .unwrap_or_default();
         let message_text = format!(
-            "{}\nCategory: {}\nAuthor: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
             topic_title_link(title, &result.topic_url),
             category_line,
+            metadata_lines,
             author,
             format_bytes(size),
             seeds,
@@ -539,11 +545,17 @@ impl App {
         let magnet = details
             .and_then(|details| details.magnet.as_deref())
             .map(str::to_string);
+        let metadata_lines = details
+            .map(format_topic_metadata_lines)
+            .filter(|lines| !lines.is_empty())
+            .map(|lines| format!("{lines}\n"))
+            .unwrap_or_default();
 
         let message = format!(
-            "{}\nCategory: {}\nAuthor: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
             topic_title_link(title, &result.topic_url),
             category_line,
+            metadata_lines,
             author,
             format_bytes(size),
             seeds,
@@ -1745,11 +1757,25 @@ fn topic_title_link(title: &str, topic_url: &str) -> String {
     )
 }
 
+fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
+    let mut lines = Vec::new();
+    if let Some(release_type) = topic.release_type.as_ref() {
+        lines.push(format!("Тип: {}", html_escape(release_type)));
+    }
+    if let Some(publication_date) = topic.publication_date.as_ref() {
+        lines.push(format!(
+            "Дата публикации: {}",
+            html_escape(publication_date)
+        ));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, format_bytes,
-        telegram_command_name, topic_title_link,
+        HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, format_bytes,
+        format_topic_metadata_lines, telegram_command_name, topic_title_link,
     };
 
     #[test]
@@ -1775,6 +1801,19 @@ mod tests {
                 "https://rutracker.org/forum/viewtopic.php?t=42&x=1"
             ),
             "<a href=\"https://rutracker.org/forum/viewtopic.php?t=42&amp;x=1\">A &amp; B</a>"
+        );
+    }
+
+    #[test]
+    fn formats_topic_metadata_lines() {
+        let topic = TopicDetails {
+            release_type: Some("авторская".to_string()),
+            publication_date: Some("07-Jun-26 12:34".to_string()),
+            ..TopicDetails::default()
+        };
+        assert_eq!(
+            format_topic_metadata_lines(&topic),
+            "Тип: авторская\nДата публикации: 07-Jun-26 12:34"
         );
     }
 
