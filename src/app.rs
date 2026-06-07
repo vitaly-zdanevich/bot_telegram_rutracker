@@ -39,6 +39,7 @@ const HELP_TEXT: &str = concat!(
     "Please seed legal torrents when you can; it helps the ecosystem. ",
     "Respect creators, and consider supporting your favorite artists and authors with money or by buying from them. ",
     "Torrents are also culture preservation: many works are public domain, Creative Commons, abandoned, or otherwise unavailable to buy legally.\n\n",
+    "If you know an indie artist, consider asking whether they want to release some work under Creative Commons and publish it legally on RuTracker, so more people can discover them.\n\n",
     "Source code: https://github.com/vitaly-zdanevich/bot_telegram_rutracker"
 );
 
@@ -1780,5 +1781,7 @@ mod tests {
         assert!(HELP_TEXT.contains("favorite artists and authors"));
         assert!(HELP_TEXT.contains("culture preservation"));
         assert!(HELP_TEXT.contains("Creative Commons"));
+        assert!(HELP_TEXT.contains("indie artist"));
+        assert!(HELP_TEXT.contains("publish it legally on RuTracker"));
     }
 }
