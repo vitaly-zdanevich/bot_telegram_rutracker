@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse, Session,
-    SessionOptions,
+    SessionOptions, TorrentStats,
 };
 use tokio::time::{sleep, timeout};
 use tracing::info;
@@ -88,22 +88,8 @@ impl TorrentDownloader {
         Fut: Future<Output = Result<()>>,
     {
         let safe_bytes = telegram_safe_file_bytes(request.max_file_mb);
-        let selected_files = request
-            .metadata
-            .files
-            .iter()
-            .filter(|file| file.size_bytes <= safe_bytes)
-            .filter(|file| {
-                request
-                    .selected_indexes
-                    .map(|indexes| indexes.contains(&file.index))
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if selected_files.is_empty() {
-            bail!("torrent has no files small enough for Telegram");
-        }
+        let selected_files =
+            selected_download_files(request.metadata, request.selected_indexes, safe_bytes)?;
         let selected_file_indexes = selected_files
             .iter()
             .map(|file| file.index)
@@ -146,36 +132,23 @@ impl TorrentDownloader {
         let mut timed_out = false;
         loop {
             let elapsed = started_at.elapsed();
-            if elapsed >= hard_timeout {
-                timed_out = true;
-                break;
-            }
-            if hard_timeout.saturating_sub(elapsed) <= final_window {
+            if download_window_expired(elapsed, hard_timeout, final_window) {
                 timed_out = true;
                 break;
             }
 
             let stats = handle.stats();
-            if let Some(error) = stats.error {
-                bail!("torrent failed: {error}");
-            }
-            for file in &selected_files {
-                if sent_indexes.contains(&file.index) {
-                    continue;
-                }
-                let have_bytes = stats.file_progress.get(file.index).copied().unwrap_or(0);
-                if have_bytes < file.size_bytes {
-                    continue;
-                }
-                let downloaded = DownloadedFile {
-                    path: self.output_dir.join(&file.path),
-                    display_name: file.path.display().to_string(),
-                    size_bytes: file.size_bytes,
-                };
-                on_file_completed(downloaded.clone(), sent_files.len() + 1, total_files).await?;
-                sent_indexes.insert(file.index);
-                sent_files.push(downloaded);
-            }
+            ensure_torrent_has_no_error(&stats)?;
+            send_completed_files(
+                &self.output_dir,
+                &stats,
+                &selected_files,
+                &mut sent_indexes,
+                &mut sent_files,
+                total_files,
+                &mut on_file_completed,
+            )
+            .await?;
             if sent_files.len() == total_files {
                 break;
             }
@@ -218,6 +191,78 @@ impl TorrentDownloader {
         .await
         .context("failed to create torrent session")
     }
+}
+
+fn selected_download_files(
+    metadata: &TorrentMetadata,
+    selected_indexes: Option<&[usize]>,
+    safe_bytes: u64,
+) -> Result<Vec<TorrentFile>> {
+    let files = metadata
+        .files
+        .iter()
+        .filter(|file| file.size_bytes <= safe_bytes)
+        .filter(|file| {
+            selected_indexes
+                .map(|indexes| indexes.contains(&file.index))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if files.is_empty() {
+        bail!("torrent has no files small enough for Telegram");
+    }
+
+    Ok(files)
+}
+
+fn download_window_expired(
+    elapsed: Duration,
+    hard_timeout: Duration,
+    final_window: Duration,
+) -> bool {
+    elapsed >= hard_timeout || hard_timeout.saturating_sub(elapsed) <= final_window
+}
+
+fn ensure_torrent_has_no_error(stats: &TorrentStats) -> Result<()> {
+    if let Some(error) = stats.error.as_ref() {
+        bail!("torrent failed: {error}");
+    }
+    Ok(())
+}
+
+async fn send_completed_files<F, Fut>(
+    output_dir: &Path,
+    stats: &TorrentStats,
+    selected_files: &[TorrentFile],
+    sent_indexes: &mut HashSet<usize>,
+    sent_files: &mut Vec<DownloadedFile>,
+    total_files: usize,
+    on_file_completed: &mut F,
+) -> Result<()>
+where
+    F: FnMut(DownloadedFile, usize, usize) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    for file in selected_files {
+        if sent_indexes.contains(&file.index) {
+            continue;
+        }
+        let have_bytes = stats.file_progress.get(file.index).copied().unwrap_or(0);
+        if have_bytes < file.size_bytes {
+            continue;
+        }
+        let downloaded = DownloadedFile {
+            path: output_dir.join(&file.path),
+            display_name: file.path.display().to_string(),
+            size_bytes: file.size_bytes,
+        };
+        on_file_completed(downloaded.clone(), sent_files.len() + 1, total_files).await?;
+        sent_indexes.insert(file.index);
+        sent_files.push(downloaded);
+    }
+    Ok(())
 }
 
 fn metadata_from_list_only(list: ListOnlyResponse) -> TorrentMetadata {

@@ -721,24 +721,26 @@ pub fn parse_topic_page(
 }
 
 fn parse_first_post_files(body: ElementRef<'_>) -> Vec<TopicFile> {
+    let files = parse_files_from_first_post_blocks(body);
+    if files.is_empty() {
+        return dedupe_files(parse_files_from_text(&text(body)));
+    }
+
+    dedupe_files(files)
+}
+
+fn parse_files_from_first_post_blocks(body: ElementRef<'_>) -> Vec<TopicFile> {
     let mut files = Vec::new();
     for block in body.select(&selector("pre, code, .sp-body, .filelist, .post_body")) {
         for text_node in block.text() {
-            for line in text_node.lines() {
-                if let Some(file) = parse_file_line(line) {
-                    files.push(file);
-                }
-            }
+            files.extend(parse_files_from_text(text_node));
         }
     }
-    if files.is_empty() {
-        for line in text(body).lines() {
-            if let Some(file) = parse_file_line(line) {
-                files.push(file);
-            }
-        }
-    }
-    dedupe_files(files)
+    files
+}
+
+fn parse_files_from_text(value: &str) -> Vec<TopicFile> {
+    value.lines().filter_map(parse_file_line).collect()
 }
 
 fn parse_file_line(line: &str) -> Option<TopicFile> {
