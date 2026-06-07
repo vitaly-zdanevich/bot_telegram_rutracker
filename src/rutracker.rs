@@ -546,7 +546,9 @@ fn description_text(body: ElementRef<'_>) -> String {
                 }
             }
             Node::Element(element)
-                if element.name() == "br" || is_description_block(element.name()) =>
+                if element.name() == "br"
+                    || is_description_block(element.name())
+                    || has_description_break_class(element) =>
             {
                 push_description_newline(&mut out);
             }
@@ -594,6 +596,14 @@ fn is_description_block(name: &str) -> bool {
             | "tr"
             | "ul"
     )
+}
+
+fn has_description_break_class(element: &scraper::node::Element) -> bool {
+    element.attr("class").is_some_and(|class| {
+        class
+            .split_whitespace()
+            .any(|name| matches!(name, "post-b" | "sp-head" | "sp-body"))
+    })
 }
 
 fn push_inline_description_text(out: &mut String, value: &str) {
@@ -1390,6 +1400,9 @@ mod tests {
                 .description_text
                 .contains("01 - First Track.flac - 30 MB\n02 - Second Track.flac - 9 MB")
         );
+        assert!(topic.description_text.contains(
+            "Об исполнителе (группе)\nДепрессивно, трансцедентально.\nДоп. информация: Источник: официальный сайт https://example.invalid/source"
+        ));
         assert!(
             topic
                 .author
