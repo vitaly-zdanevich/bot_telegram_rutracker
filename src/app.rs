@@ -28,7 +28,7 @@ const HELP_TEXT: &str = concat!(
     "This is an unofficial bot and is not affiliated with RuTracker.\n\n",
     "Send a RuTracker search string. I search rutracker.org titles and return matching topics.\n\n",
     "Use <code>c text</code> to search categories. Category buttons from normal search results rerun the same query inside that category.\n\n",
-    "Download only sends files smaller than 50 MB because Telegram Bot API documents bot uploads with sendDocument as limited to 50 MB: ",
+    "Downloads are limited to files under 50 MB because Telegram Bot API has that upload limit: ",
     "https://core.telegram.org/bots/api#senddocument\n\n",
     "Torrent downloads use librqbit, the rqbit torrent client library: ",
     "https://github.com/ikatson/rqbit\n\n",
