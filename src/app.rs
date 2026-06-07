@@ -36,6 +36,9 @@ const HELP_TEXT: &str = concat!(
     "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
     "If RuTracker is unavailable, I return the official news channel link: @rutracker_news. ",
     "RuTracker runs on low-cost community infrastructure; please consider donating to them.\n\n",
+    "Please seed legal torrents when you can; it helps the ecosystem. ",
+    "Respect creators, and consider supporting your favorite artists and authors with money or by buying from them. ",
+    "Torrents are also culture preservation: many works are public domain, Creative Commons, abandoned, or otherwise unavailable to buy legally.\n\n",
     "Source code: https://github.com/vitaly-zdanevich/bot_telegram_rutracker"
 );
 
@@ -1773,5 +1776,9 @@ mod tests {
         );
         assert!(HELP_TEXT.contains("unofficial bot"));
         assert!(HELP_TEXT.contains("donating"));
+        assert!(HELP_TEXT.contains("seed legal torrents"));
+        assert!(HELP_TEXT.contains("favorite artists and authors"));
+        assert!(HELP_TEXT.contains("culture preservation"));
+        assert!(HELP_TEXT.contains("Creative Commons"));
     }
 }
