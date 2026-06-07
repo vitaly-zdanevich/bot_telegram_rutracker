@@ -46,6 +46,7 @@ pub struct SearchResult {
     pub topic_id: u64,
     pub title: String,
     pub author: Option<String>,
+    pub author_profile_url: Option<String>,
     pub category: Option<CategoryRef>,
     pub size_bytes: u64,
     pub seeds: i64,
@@ -84,6 +85,7 @@ pub struct TopicDetails {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorDetails {
     pub name: String,
+    pub profile_url: Option<String>,
     pub posts_count: Option<u64>,
     pub avatar_url: Option<String>,
 }
@@ -617,10 +619,13 @@ pub fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<SearchResu
             })
             .map(|url| url.to_string());
 
+        let (author, author_profile_url) = extract_search_author(row, base_url);
+
         results.push(SearchResult {
             topic_id,
             title,
-            author: extract_author(row),
+            author,
+            author_profile_url,
             category,
             size_bytes: extract_size_from_row(row),
             seeds: extract_seed_count(row),
@@ -662,13 +667,24 @@ fn capture_u64(value: &str, pattern: &str) -> Option<u64> {
         .ok()
 }
 
-fn extract_author(row: ElementRef<'_>) -> Option<String> {
-    row.select(&selector(
-        ".u-name a, td.u-name a, a[href*=\"profile.php?mode=viewprofile\"]",
-    ))
-    .next()
-    .map(text)
-    .filter(|value| !value.is_empty())
+fn extract_search_author(row: ElementRef<'_>, base_url: &Url) -> (Option<String>, Option<String>) {
+    let Some(link) = row
+        .select(&selector(
+            ".u-name a, td.u-name a, a[href*=\"profile.php?mode=viewprofile\"]",
+        ))
+        .next()
+    else {
+        return (None, None);
+    };
+    let name = text(link);
+    if name.is_empty() {
+        return (None, None);
+    }
+    let profile_url = link
+        .value()
+        .attr("href")
+        .and_then(|href| attr_url(base_url, href));
+    (Some(name), profile_url)
 }
 
 fn extract_size_from_row(row: ElementRef<'_>) -> u64 {
@@ -877,13 +893,23 @@ fn dedupe_files(files: Vec<TopicFile>) -> Vec<TopicFile> {
 }
 
 fn parse_author_from_post(post: ElementRef<'_>, base_url: &Url) -> Option<AuthorDetails> {
-    let name = post
+    let linked_author = post
         .select(&selector(
-            ".nick a, .nick, .poster_info a, .post-author a, p.nick a",
+            ".nick a, .poster_info a[href*=\"profile.php\"], .post-author a, p.nick a",
         ))
-        .next()
-        .map(text)
-        .filter(|value| !value.is_empty())?;
+        .next();
+    let plain_author = || post.select(&selector(".nick, .post-author, p.nick")).next();
+    let author = linked_author.or_else(plain_author)?;
+    let name = text(author);
+    if name.is_empty() {
+        return None;
+    }
+    let profile_url = linked_author.and_then(|author| {
+        author
+            .value()
+            .attr("href")
+            .and_then(|href| attr_url(base_url, href))
+    });
     let posts_count = post
         .select(&selector(
             ".poster_info, .joined, .post-author-details, td.row1",
@@ -909,6 +935,7 @@ fn parse_author_from_post(post: ElementRef<'_>, base_url: &Url) -> Option<Author
 
     Some(AuthorDetails {
         name,
+        profile_url,
         posts_count,
         avatar_url,
     })
@@ -1205,6 +1232,14 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].topic_id, 6849001);
         assert_eq!(results[0].title, "Legal Indie Album - 2026 [FLAC]");
+        assert_eq!(results[0].author.as_deref(), Some("artist"));
+        assert!(
+            results[0]
+                .author_profile_url
+                .as_ref()
+                .unwrap()
+                .contains("profile.php?mode=viewprofile")
+        );
         assert_eq!(results[0].category.as_ref().unwrap().id, 123);
         assert_eq!(results[0].size_bytes, 41_943_040);
         assert_eq!(results[0].seeds, 17);
@@ -1227,6 +1262,16 @@ mod tests {
         let topic = parse_topic(html, 6849001, &base()).unwrap();
         assert_eq!(topic.title, "Legal Indie Album - 2026 [FLAC]");
         assert_eq!(topic.author.as_ref().unwrap().name, "artist");
+        assert!(
+            topic
+                .author
+                .as_ref()
+                .unwrap()
+                .profile_url
+                .as_ref()
+                .unwrap()
+                .contains("profile.php?mode=viewprofile")
+        );
         assert_eq!(topic.author.as_ref().unwrap().posts_count, Some(321));
         assert_eq!(topic.release_type.as_deref(), Some("авторская"));
         assert_eq!(topic.publication_date.as_deref(), Some("07-Jun-26 12:34"));

@@ -293,7 +293,9 @@ impl App {
             self.telegram
                 .answer_callback(&callback.id, "Loading description...")
                 .await?;
-            return self.handle_description(chat_id, topic_id).await;
+            return self
+                .handle_description(chat_id, topic_id, callback_message)
+                .await;
         }
         if let Some(topic_id) = data.strip_prefix("files:").and_then(parse_u64) {
             self.telegram
@@ -423,7 +425,7 @@ impl App {
         let author = details
             .and_then(|details| details.author.as_ref())
             .map(format_author)
-            .or_else(|| result.author.as_ref().map(|name| html_escape(name)))
+            .or_else(|| format_search_author(result))
             .unwrap_or_else(|| "unknown".to_string());
         let metadata_lines = details
             .map(format_topic_metadata_lines)
@@ -469,6 +471,7 @@ impl App {
     }
 
     async fn run_search(&self, chat_id: i64, query: &str, forum_id: Option<u64>) -> Result<()> {
+        let _typing = self.telegram.start_chat_action_heartbeat(chat_id, "typing");
         let progress = self
             .telegram
             .send_status_message(chat_id, "Searching RuTracker...")
@@ -523,7 +526,7 @@ impl App {
         let author = details
             .and_then(|details| details.author.as_ref())
             .map(format_author)
-            .or_else(|| result.author.as_ref().map(|name| html_escape(name)))
+            .or_else(|| format_search_author(result))
             .unwrap_or_else(|| "unknown".to_string());
         let size = details
             .and_then(|details| details.total_size_bytes)
@@ -681,11 +684,20 @@ impl App {
         Ok(())
     }
 
-    async fn handle_description(&self, chat_id: i64, topic_id: u64) -> Result<()> {
+    async fn handle_description(
+        &self,
+        chat_id: i64,
+        topic_id: u64,
+        progress: Option<ProgressMessage>,
+    ) -> Result<()> {
         let topic = match self.cached_topic(topic_id).await {
             Ok(topic) => topic,
             Err(err) => {
-                self.send_rutracker_unavailable(chat_id, &err).await?;
+                if let Some(progress) = progress {
+                    self.edit_rutracker_unavailable(progress, &err).await?;
+                } else {
+                    self.send_rutracker_unavailable(chat_id, &err).await?;
+                }
                 return Ok(());
             }
         };
@@ -698,7 +710,11 @@ impl App {
                 html_escape(&truncate_for_telegram(&topic.description_text, 3500))
             )
         };
-        self.telegram.send_message(chat_id, &text, None).await?;
+        if let Some(progress) = progress {
+            self.telegram.edit_message(progress, &text, None).await?;
+        } else {
+            self.telegram.send_message(chat_id, &text, None).await?;
+        }
         for image in topic.first_post_images.iter().take(10) {
             if let Err(err) = self
                 .telegram
@@ -1508,7 +1524,7 @@ where
 }
 
 fn format_author(author: &AuthorDetails) -> String {
-    let mut text = html_escape(&author.name);
+    let mut text = author_name_link(&author.name, author.profile_url.as_deref());
     if let Some(posts) = author.posts_count {
         text.push_str(&format!(" ({} messages)", posts));
     }
@@ -1521,9 +1537,27 @@ fn format_author(author: &AuthorDetails) -> String {
     text
 }
 
+fn format_search_author(result: &SearchResult) -> Option<String> {
+    result
+        .author
+        .as_ref()
+        .map(|name| author_name_link(name, result.author_profile_url.as_deref()))
+}
+
+fn author_name_link(name: &str, profile_url: Option<&str>) -> String {
+    match profile_url {
+        Some(profile_url) => format!(
+            "<a href=\"{}\">{}</a>",
+            html_escape(profile_url),
+            html_escape(name)
+        ),
+        None => html_escape(name),
+    }
+}
+
 fn comment_author_line(author: Option<&AuthorDetails>) -> String {
     match author {
-        Some(author) => format!("<b>{}</b>", format_author(author)),
+        Some(author) => format_author(author),
         None => "<b>unknown</b>".to_string(),
     }
 }
@@ -1774,8 +1808,8 @@ fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, format_bytes,
-        format_topic_metadata_lines, telegram_command_name, topic_title_link,
+        HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, author_name_link,
+        format_bytes, format_topic_metadata_lines, telegram_command_name, topic_title_link,
     };
 
     #[test]
@@ -1801,6 +1835,17 @@ mod tests {
                 "https://rutracker.org/forum/viewtopic.php?t=42&x=1"
             ),
             "<a href=\"https://rutracker.org/forum/viewtopic.php?t=42&amp;x=1\">A &amp; B</a>"
+        );
+    }
+
+    #[test]
+    fn formats_author_name_as_profile_link() {
+        assert_eq!(
+            author_name_link(
+                "artist & author",
+                Some("https://rutracker.org/forum/profile.php?mode=viewprofile&u=12")
+            ),
+            "<a href=\"https://rutracker.org/forum/profile.php?mode=viewprofile&amp;u=12\">artist &amp; author</a>"
         );
     }
 
