@@ -10,7 +10,7 @@ const DEFAULT_RUTRACKER_BASE_URLS: &str =
     "https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum";
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_HTTP_TIMEOUT_SECONDS: u64 = 25;
-const DEFAULT_HTTP_MAX_ATTEMPTS: usize = 2;
+const DEFAULT_HTTP_MAX_ATTEMPTS: usize = 10;
 const DEFAULT_LAMBDA_TIMEOUT_SECONDS: u64 = 900;
 const DEFAULT_DOWNLOAD_MARGIN_SECONDS: u64 = 20;
 const DEFAULT_PEER_LIMIT: usize = 120;
@@ -55,7 +55,7 @@ impl Config {
                 DEFAULT_HTTP_TIMEOUT_SECONDS,
             )?,
             http_max_attempts: parse_env("RUTRACKER_HTTP_MAX_ATTEMPTS", DEFAULT_HTTP_MAX_ATTEMPTS)?
-                .clamp(1, 5),
+                .clamp(1, 10),
             tmp_dir: PathBuf::from(optional_env("TMP_DIR").unwrap_or_else(|| "/tmp".to_string())),
             max_file_mb: parse_env("MAX_FILE_MB", TELEGRAM_MAX_FILE_MB_DEFAULT)?,
             lambda_timeout_seconds: parse_env(

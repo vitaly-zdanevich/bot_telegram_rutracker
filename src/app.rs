@@ -1,14 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hmac::{Hmac, KeyInit, Mac};
 use lambda_http::http::{Method, StatusCode};
 use lambda_http::{Body, Error, IntoResponse, Request, Response};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use sha2::{Digest as Sha256Digest, Sha256};
+use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
@@ -18,8 +22,9 @@ use crate::rutracker::{
     ensure_same_topic, require_magnet, validate_forum_query,
 };
 use crate::telegram::{
-    CallbackQuery, InlineQuery, Message, ProgressMessage, Telegram, Update, callback_button,
-    copy_button, html_escape, inline_keyboard, truncate_for_telegram, url_button,
+    CallbackQuery, InlineQuery, Message, ProgressMessage, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS,
+    Telegram, Update, callback_button, copy_button, countdown_status_text, html_escape,
+    inline_keyboard, truncate_for_telegram, url_button,
 };
 use crate::telegram_safe_file_bytes;
 use crate::torrent::{TorrentFile, TorrentMetadata};
@@ -47,13 +52,16 @@ const RUTRACKER_NEWS_URL: &str = "https://t.me/rutracker_news";
 const RUTRACKER_UNAVAILABLE_TEXT: &str = concat!(
     "RuTracker is unavailable from this Lambda right now. ",
     "Check their official news channel for status: ",
-    "<a href=\"https://t.me/rutracker_news\">@rutracker_news</a>. ",
+    "<a href=\"https://t.me/rutracker_news\">@rutracker_news</a>.\n",
     "RuTracker runs on low-cost community infrastructure; please consider donating to them."
 );
+const WORKER_FUNCTION_NAME_ENV: &str = "WORKER_FUNCTION_NAME";
+const DOWNLOAD_PROMPT_TEXT: &str = "<b>Download</b>\nChoose all files under 50 MB, or select specific files from torrent metadata.";
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
 
 static QUERY_CACHE: OnceLock<Mutex<HashMap<String, QueryCacheEntry>>> = OnceLock::new();
+static UPDATE_CACHE: OnceLock<CacheStore<i64, ()>> = OnceLock::new();
 static SEARCH_CACHE: OnceLock<CacheStore<String, Vec<SearchResult>>> = OnceLock::new();
 static TOPIC_CACHE: OnceLock<CacheStore<u64, TopicDetails>> = OnceLock::new();
 static COMMENT_PAGE_CACHE: OnceLock<CacheStore<(u64, u32), TopicDetails>> = OnceLock::new();
@@ -87,36 +95,174 @@ struct DownloadSelection {
     page: usize,
 }
 
-pub async fn handler(request: Request) -> Result<impl IntoResponse, Error> {
-    let config = Config::from_env()?;
-
+pub async fn webhook_handler(request: Request) -> Result<impl IntoResponse, Error> {
     if request.method() != Method::POST {
         return Ok(response(StatusCode::OK, "ok"));
     }
 
+    let webhook_secret = crate::config::required_env("TELEGRAM_WEBHOOK_SECRET")?;
     let actual_secret = request
         .headers()
         .get("x-telegram-bot-api-secret-token")
         .and_then(|value| value.to_str().ok());
-    if actual_secret != Some(config.telegram_webhook_secret.as_str()) {
+    if actual_secret != Some(webhook_secret.as_str()) {
         warn!("rejected webhook with missing or invalid secret token");
         return Ok(response(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
 
-    let update = match parse_update(request.body()) {
+    let payload = match request_body_bytes(request.body()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            warn!(error = %err, "ignored invalid Telegram request body");
+            return Ok(response(StatusCode::OK, "ignored"));
+        }
+    };
+    let update = match parse_update_bytes(&payload) {
         Ok(update) => update,
         Err(err) => {
             warn!(error = %err, "ignored invalid Telegram update");
             return Ok(response(StatusCode::OK, "ignored"));
         }
     };
+    let worker_function_name = crate::config::required_env(WORKER_FUNCTION_NAME_ENV)?;
+    invoke_worker(&worker_function_name, payload).await?;
+    info!(
+        update_id = update.update_id,
+        worker_function_name, "queued Telegram update for worker"
+    );
 
+    Ok(response(StatusCode::OK, "ok"))
+}
+
+pub async fn handle_worker_payload(payload: Value) -> Result<Value> {
+    let update: Update = serde_json::from_value(payload).context("failed to parse worker event")?;
+    let config = Config::from_env()?;
     let app = App::new(config)?;
     if let Err(err) = app.handle_update(update).await {
         error!(error = %err, "failed to handle Telegram update");
     }
 
-    Ok(response(StatusCode::OK, "ok"))
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+async fn invoke_worker(function_name: &str, payload: Vec<u8>) -> Result<(), Error> {
+    invoke_worker_signed(function_name, payload).await?;
+    Ok(())
+}
+
+// Avoid the full AWS SDK here: the webhook only needs one signed Invoke call,
+// and the SDK brings a large dependency tree into the latency-sensitive binary.
+async fn invoke_worker_signed(function_name: &str, payload: Vec<u8>) -> Result<()> {
+    let region = env::var("AWS_REGION")
+        .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+        .context("AWS_REGION is required to invoke worker Lambda")?;
+    let access_key = crate::config::required_env("AWS_ACCESS_KEY_ID")?;
+    let secret_key = crate::config::required_env("AWS_SECRET_ACCESS_KEY")?;
+    let session_token = crate::config::optional_env("AWS_SESSION_TOKEN");
+    let host = format!("lambda.{region}.amazonaws.com");
+    let canonical_uri = format!(
+        "/2015-03-31/functions/{}/invocations",
+        urlencoding::encode(function_name)
+    );
+    let url = format!("https://{host}{canonical_uri}");
+    let payload_hash = hex_lower(&Sha256::digest(&payload));
+    let now = OffsetDateTime::now_utc();
+    let date = format!(
+        "{:04}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    );
+    let amz_date = format!(
+        "{date}T{:02}{:02}{:02}Z",
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+
+    let mut headers = vec![
+        ("content-type", "application/json".to_string()),
+        ("host", host.clone()),
+        ("x-amz-content-sha256", payload_hash.clone()),
+        ("x-amz-date", amz_date.clone()),
+        ("x-amz-invocation-type", "Event".to_string()),
+    ];
+    if let Some(token) = session_token.as_ref() {
+        headers.push(("x-amz-security-token", token.clone()));
+    }
+    headers.sort_by_key(|(name, _)| *name);
+    let canonical_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{}\n", value.trim()))
+        .collect::<String>();
+    let signed_headers = headers
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_request =
+        format!("POST\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let credential_scope = format!("{date}/{region}/lambda/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        hex_lower(&Sha256::digest(canonical_request.as_bytes()))
+    );
+    let signing_key = aws_v4_signing_key(&secret_key, &date, &region, "lambda")?;
+    let signature = hex_lower(&hmac_sha256(&signing_key, string_to_sign.as_bytes())?);
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("x-amz-content-sha256", payload_hash)
+        .header("x-amz-date", amz_date)
+        .header("x-amz-invocation-type", "Event")
+        .header("authorization", authorization);
+    if let Some(token) = session_token {
+        request = request.header("x-amz-security-token", token);
+    }
+    let response = request
+        .body(payload)
+        .send()
+        .await
+        .context("failed to invoke worker Lambda")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("worker Lambda invoke failed with {status}: {body}");
+    }
+    Ok(())
+}
+
+fn aws_v4_signing_key(
+    secret_key: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> Result<Vec<u8>> {
+    let date_key = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date.as_bytes())?;
+    let region_key = hmac_sha256(&date_key, region.as_bytes())?;
+    let service_key = hmac_sha256(&region_key, service.as_bytes())?;
+    hmac_sha256(&service_key, b"aws4_request")
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).context("failed to create HMAC")?;
+    mac.update(value);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn response(status: StatusCode, body: &'static str) -> Response<Body> {
@@ -127,13 +273,17 @@ fn response(status: StatusCode, body: &'static str) -> Response<Body> {
         .expect("static response is valid")
 }
 
-fn parse_update(body: &Body) -> Result<Update> {
+fn request_body_bytes(body: &Body) -> Result<Vec<u8>> {
     match body {
-        Body::Text(text) => serde_json::from_str(text).context("failed to parse text body"),
-        Body::Binary(bytes) => serde_json::from_slice(bytes).context("failed to parse binary body"),
+        Body::Text(text) => Ok(text.as_bytes().to_vec()),
+        Body::Binary(bytes) => Ok(bytes.clone()),
         Body::Empty => bail!("empty body"),
         _ => bail!("unsupported request body type"),
     }
+}
+
+fn parse_update_bytes(bytes: &[u8]) -> Result<Update> {
+    serde_json::from_slice(bytes).context("failed to parse Telegram update")
 }
 
 struct App {
@@ -169,6 +319,14 @@ impl App {
     }
 
     async fn handle_update(&self, update: Update) -> Result<()> {
+        if !mark_update_seen(update.update_id) {
+            info!(
+                update_id = update.update_id,
+                "ignored duplicate Telegram update"
+            );
+            return Ok(());
+        }
+
         if let Some(callback) = update.callback_query {
             return self.handle_callback(callback).await;
         }
@@ -258,7 +416,13 @@ impl App {
                 .answer_callback(&callback.id, "Choose download mode...")
                 .await?;
             return self
-                .handle_download_prompt(chat_id, topic_id, callback_message)
+                .handle_download_prompt(
+                    chat_id,
+                    topic_id,
+                    callback_message,
+                    callback_reply_markup,
+                    callback_text,
+                )
                 .await;
         }
         if let Some(topic_id) = data.strip_prefix("dlall:").and_then(parse_u64) {
@@ -591,11 +755,11 @@ impl App {
 
         let mut rows = vec![
             vec![
-                callback_button("Download", &format!("dl:{}", result.topic_id)),
                 callback_button("Description", &format!("desc:{}", result.topic_id)),
+                callback_button("Files", &format!("files:{}", result.topic_id)),
             ],
             vec![
-                callback_button("Files", &format!("files:{}", result.topic_id)),
+                callback_button("Download", &format!("dl:{}", result.topic_id)),
                 magnet_button(magnet.as_deref(), result.topic_id),
             ],
         ];
@@ -998,21 +1162,81 @@ impl App {
         chat_id: i64,
         topic_id: u64,
         progress: Option<ProgressMessage>,
+        reply_markup: Option<Value>,
+        current_text: Option<String>,
     ) -> Result<()> {
-        let text = "Download files smaller than 50 MB?\n\nChoose all small files, or select specific files from torrent metadata.";
-        let keyboard = inline_keyboard(vec![vec![
-            callback_button("All under 50 MB", &format!("dlall:{topic_id}")),
-            callback_button("Select", &format!("sel:{topic_id}")),
-        ]]);
+        let topic = match self.cached_topic(topic_id).await {
+            Ok(topic) => topic,
+            Err(err) => {
+                if let Some(progress) = progress {
+                    self.edit_rutracker_unavailable(progress, &err).await?;
+                } else {
+                    self.send_rutracker_unavailable(chat_id, &err).await?;
+                }
+                return Ok(());
+            }
+        };
+        let include_description = message_has_section(current_text.as_deref(), "Description");
+        let existing_files = self.existing_files_section(&topic, current_text.as_deref());
+        let text = self.topic_message_with_download_prompt(
+            &topic,
+            include_description,
+            existing_files.as_deref(),
+        )?;
+        let reply_markup = download_prompt_reply_markup(
+            reply_markup,
+            topic_id,
+            all_files_button_label(&topic, self.config.max_file_mb),
+        );
         if let Some(progress) = progress {
             self.telegram
-                .edit_message(progress, text, Some(keyboard))
+                .edit_message(progress, &text, reply_markup)
                 .await
         } else {
             self.telegram
-                .send_message(chat_id, text, Some(keyboard))
+                .send_message(chat_id, &text, reply_markup)
                 .await
         }
+    }
+
+    fn topic_message_with_download_prompt(
+        &self,
+        topic: &TopicDetails,
+        include_description: bool,
+        existing_files: Option<&str>,
+    ) -> Result<String> {
+        let mut text = if include_description && !topic.description_text.is_empty() {
+            self.topic_message_with_description(
+                topic,
+                &html_escape(&truncate_for_telegram(&topic.description_text, 2400)),
+            )?
+        } else {
+            self.topic_message_header(topic)?
+        };
+        if let Some(existing_files) = existing_files {
+            let with_files = format!("{text}\n\n{existing_files}\n\n{DOWNLOAD_PROMPT_TEXT}");
+            if with_files.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
+                return Ok(with_files);
+            }
+        }
+        text.push_str("\n\n");
+        text.push_str(DOWNLOAD_PROMPT_TEXT);
+        Ok(text)
+    }
+
+    fn existing_files_section(
+        &self,
+        topic: &TopicDetails,
+        current_text: Option<&str>,
+    ) -> Option<String> {
+        if !message_has_files_section(current_text) {
+            return None;
+        }
+        if !topic.first_post_files.is_empty() {
+            return Some(files_from_topic_text(topic, self.config.max_file_mb));
+        }
+        cached_metadata_value(topic.topic_id)
+            .map(|metadata| files_from_metadata_text(&metadata.files, self.config.max_file_mb))
     }
 
     async fn handle_select_files(
@@ -1375,7 +1599,10 @@ impl App {
         };
 
         self.telegram
-            .try_edit_message(progress, "Downloading selected files...\n15 minutes left")
+            .try_edit_message(
+                progress,
+                &countdown_status_text("Downloading selected files...", 15),
+            )
             .await;
         let telegram = self.telegram.clone();
         let title = topic.title.clone();
@@ -1706,6 +1933,13 @@ where
     );
 }
 
+fn cached_metadata_value(topic_id: u64) -> Option<TorrentMetadata> {
+    cache_get(
+        METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+        &topic_id,
+    )
+}
+
 fn format_author(author: &AuthorDetails) -> String {
     let mut text = author_name_link(&author.name, author.profile_url.as_deref());
     if let Some(posts) = author.posts_count {
@@ -1894,6 +2128,24 @@ fn save_download_selection(key: &str, selection: DownloadSelection) {
     );
 }
 
+fn mark_update_seen(update_id: i64) -> bool {
+    let cache = UPDATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("update cache poisoned");
+    let now = now_seconds();
+    guard.retain(|_, entry| now.saturating_sub(entry.created_at) < RAM_CACHE_TTL_SECONDS);
+    if guard.contains_key(&update_id) {
+        return false;
+    }
+    guard.insert(
+        update_id,
+        CacheEntry {
+            value: (),
+            created_at: now,
+        },
+    );
+    true
+}
+
 fn store_query_cache(query: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(query.as_bytes());
@@ -1978,6 +2230,81 @@ fn message_has_section(text: Option<&str>, section: &str) -> bool {
     text.is_some_and(|text| text.lines().any(|line| line.trim() == section))
 }
 
+fn message_has_files_section(text: Option<&str>) -> bool {
+    text.is_some_and(|text| {
+        text.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("Files from first post:")
+                || line.starts_with("Files from torrent metadata")
+        })
+    })
+}
+
+fn all_files_button_label(topic: &TopicDetails, max_file_mb: u64) -> &'static str {
+    let safe_bytes = telegram_safe_file_bytes(max_file_mb);
+    let has_oversized_file = topic
+        .first_post_files
+        .iter()
+        .any(|file| file.size_bytes.is_some_and(|size| size > safe_bytes));
+    if has_oversized_file {
+        "All under 50 MB"
+    } else {
+        "All"
+    }
+}
+
+fn download_prompt_reply_markup(
+    reply_markup: Option<Value>,
+    topic_id: u64,
+    all_files_label: &str,
+) -> Option<Value> {
+    let choice_row = vec![
+        callback_button(all_files_label, &format!("dlall:{topic_id}")),
+        callback_button("Select", &format!("sel:{topic_id}")),
+    ];
+    let Some(mut reply_markup) = reply_markup else {
+        return Some(inline_keyboard(vec![choice_row]));
+    };
+    let Some(rows) = reply_markup
+        .get_mut("inline_keyboard")
+        .and_then(Value::as_array_mut)
+    else {
+        return Some(inline_keyboard(vec![choice_row]));
+    };
+
+    let download_callback = format!("dl:{topic_id}");
+    let mut filtered_rows = Vec::with_capacity(rows.len() + 1);
+    let mut insert_index = None;
+    for row in std::mem::take(rows) {
+        match row {
+            Value::Array(buttons) => {
+                let mut removed_download = false;
+                let buttons = buttons
+                    .into_iter()
+                    .filter(|button| {
+                        let should_remove = button.get("callback_data").and_then(Value::as_str)
+                            == Some(download_callback.as_str());
+                        removed_download |= should_remove;
+                        !should_remove
+                    })
+                    .collect::<Vec<_>>();
+                if removed_download && insert_index.is_none() {
+                    insert_index = Some(filtered_rows.len());
+                }
+                if !buttons.is_empty() {
+                    filtered_rows.push(Value::Array(buttons));
+                }
+            }
+            other => filtered_rows.push(other),
+        }
+    }
+
+    let insert_index = insert_index.unwrap_or(0).min(filtered_rows.len());
+    filtered_rows.insert(insert_index, Value::Array(choice_row));
+    *rows = filtered_rows;
+    Some(reply_markup)
+}
+
 fn remove_callback_button(reply_markup: Option<Value>, callback_data: &str) -> Option<Value> {
     let mut reply_markup = reply_markup?;
     let Some(rows) = reply_markup
@@ -2024,11 +2351,47 @@ fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use crate::config::Config;
+    use crate::rutracker::{CategoryRef, RutrackerClient, TopicFile};
+    use crate::telegram::{TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, Telegram};
+
     use super::{
-        HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, author_name_link,
-        callback_button, format_bytes, format_topic_metadata_lines, inline_keyboard,
-        message_has_section, remove_callback_button, telegram_command_name, topic_title_link,
+        App, HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails,
+        all_files_button_label, author_name_link, callback_button, download_prompt_reply_markup,
+        files_from_topic_text, format_bytes, format_topic_metadata_lines, inline_keyboard,
+        mark_update_seen, message_has_files_section, message_has_section, remove_callback_button,
+        telegram_command_name, topic_title_link,
     };
+
+    fn test_app() -> App {
+        let base_urls = vec!["https://rutracker.org/forum".to_string()];
+        let config = Config {
+            telegram_bot_token: "telegram-token".to_string(),
+            telegram_webhook_secret: "webhook-secret".to_string(),
+            allowed_telegram_user_ids: HashSet::new(),
+            rutracker_base_urls: base_urls.clone(),
+            rutracker_cookie: None,
+            rutracker_username: None,
+            rutracker_password: None,
+            search_limit: 10,
+            http_timeout_seconds: 1,
+            http_max_attempts: 1,
+            tmp_dir: PathBuf::from("/tmp"),
+            max_file_mb: 50,
+            lambda_timeout_seconds: 900,
+            download_margin_seconds: 20,
+            peer_limit: 120,
+        };
+        let rutracker = RutrackerClient::new(&base_urls, None, None, 1, 1).unwrap();
+        App {
+            config,
+            telegram: Telegram::new("telegram-token".to_string()),
+            rutracker,
+        }
+    }
 
     #[test]
     fn formats_bytes() {
@@ -2080,13 +2443,156 @@ mod tests {
     }
 
     #[test]
+    fn detects_file_sections() {
+        assert!(message_has_files_section(Some(
+            "Title\n\nFiles from first post: Album\ntrack.flac - 30 MB"
+        )));
+        assert!(message_has_files_section(Some(
+            "Title\n\nFiles from torrent metadata\ntrack.flac - 30 MB"
+        )));
+        assert!(!message_has_files_section(Some(
+            "Title\n\nDownload\nSelect files"
+        )));
+    }
+
+    #[test]
+    fn download_prompt_preserves_existing_files_section_when_it_fits() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            category_path: vec![CategoryRef {
+                id: 23,
+                name: "Music".to_string(),
+            }],
+            description_text: "Track list".to_string(),
+            first_post_files: vec![TopicFile {
+                path: "track.flac".to_string(),
+                size_bytes: Some(30 * 1024 * 1024),
+            }],
+            ..TopicDetails::default()
+        };
+        let files = files_from_topic_text(&topic, app.config.max_file_mb);
+
+        let text = app
+            .topic_message_with_download_prompt(&topic, true, Some(&files))
+            .unwrap();
+
+        assert!(text.contains("<b>Description</b>"));
+        assert!(text.contains("<b>Download</b>"));
+        assert!(text.contains("Files from first post"));
+        assert!(text.contains("track.flac"));
+    }
+
+    #[test]
+    fn download_prompt_drops_existing_files_section_when_it_would_not_fit() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            category_path: vec![CategoryRef {
+                id: 23,
+                name: "Music".to_string(),
+            }],
+            description_text: "Track list".to_string(),
+            ..TopicDetails::default()
+        };
+        let files = format!(
+            "<b>Files from first post: Album</b>\ntrack.flac\n{}",
+            "x".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS)
+        );
+
+        let text = app
+            .topic_message_with_download_prompt(&topic, true, Some(&files))
+            .unwrap();
+
+        assert!(text.contains("<b>Description</b>"));
+        assert!(text.contains("<b>Download</b>"));
+        assert!(!text.contains("Files from first post"));
+        assert!(!text.contains("track.flac"));
+    }
+
+    #[test]
+    fn marks_duplicate_updates_seen() {
+        let update_id = i64::MIN + 4242;
+        assert!(mark_update_seen(update_id));
+        assert!(!mark_update_seen(update_id));
+    }
+
+    #[test]
+    fn replaces_download_button_with_choice_buttons() {
+        let markup = inline_keyboard(vec![
+            vec![
+                callback_button("Description", "desc:42"),
+                callback_button("Files", "files:42"),
+            ],
+            vec![callback_button("Download", "dl:42")],
+        ]);
+
+        let filtered = download_prompt_reply_markup(Some(markup), 42, "All under 50 MB").unwrap();
+        let rows = filtered
+            .get("inline_keyboard")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1][0]
+                .get("callback_data")
+                .and_then(serde_json::Value::as_str),
+            Some("dlall:42")
+        );
+        assert_eq!(
+            rows[1][1]
+                .get("callback_data")
+                .and_then(serde_json::Value::as_str),
+            Some("sel:42")
+        );
+        assert_eq!(
+            rows[0][0]
+                .get("callback_data")
+                .and_then(serde_json::Value::as_str),
+            Some("desc:42")
+        );
+    }
+
+    #[test]
+    fn labels_download_all_button_from_known_file_sizes() {
+        let all_files_fit_topic = TopicDetails {
+            first_post_files: vec![TopicFile {
+                path: "track.mp3".to_string(),
+                size_bytes: Some(10 * 1024 * 1024),
+            }],
+            ..TopicDetails::default()
+        };
+        let oversized_file_topic = TopicDetails {
+            first_post_files: vec![
+                TopicFile {
+                    path: "track.mp3".to_string(),
+                    size_bytes: Some(10 * 1024 * 1024),
+                },
+                TopicFile {
+                    path: "video.mkv".to_string(),
+                    size_bytes: Some(100 * 1024 * 1024),
+                },
+            ],
+            ..TopicDetails::default()
+        };
+
+        assert_eq!(all_files_button_label(&all_files_fit_topic, 50), "All");
+        assert_eq!(
+            all_files_button_label(&oversized_file_topic, 50),
+            "All under 50 MB"
+        );
+    }
+
+    #[test]
     fn removes_used_callback_button_from_reply_markup() {
         let markup = inline_keyboard(vec![
             vec![
-                callback_button("Download", "dl:42"),
                 callback_button("Description", "desc:42"),
+                callback_button("Files", "files:42"),
             ],
-            vec![callback_button("Files", "files:42")],
+            vec![callback_button("Download", "dl:42")],
         ]);
 
         let filtered = remove_callback_button(Some(markup), "desc:42").unwrap();
@@ -2099,14 +2605,14 @@ mod tests {
             rows[0][0]
                 .get("callback_data")
                 .and_then(serde_json::Value::as_str),
-            Some("dl:42")
+            Some("files:42")
         );
         assert_eq!(rows[0].as_array().unwrap().len(), 1);
         assert_eq!(
             rows[1][0]
                 .get("callback_data")
                 .and_then(serde_json::Value::as_str),
-            Some("files:42")
+            Some("dl:42")
         );
 
         let filtered = remove_callback_button(
@@ -2140,6 +2646,7 @@ mod tests {
     fn rutracker_unavailable_message_points_to_news_channel() {
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("@rutracker_news"));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains(RUTRACKER_NEWS_URL));
+        assert!(RUTRACKER_UNAVAILABLE_TEXT.contains(".\nRuTracker runs"));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("donating"));
     }
 

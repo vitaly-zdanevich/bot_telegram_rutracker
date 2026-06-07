@@ -11,6 +11,10 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tracing::warn;
 
+// Telegram documents message text as 1-4096 characters after entity parsing.
+// https://core.telegram.org/bots/api#editmessagetext
+pub const TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS: usize = 4096;
+
 #[derive(Debug, Deserialize)]
 pub struct Update {
     pub update_id: i64,
@@ -130,7 +134,7 @@ impl Telegram {
     ) -> Result<Value> {
         let mut payload = json!({
             "chat_id": chat_id,
-            "text": truncate_for_telegram(text, 3900),
+            "text": truncate_for_telegram(text, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS),
             "disable_web_page_preview": true
         });
         if let Some(markup) = reply_markup {
@@ -166,7 +170,7 @@ impl Telegram {
         let mut payload = json!({
             "chat_id": progress.chat_id,
             "message_id": progress.message_id,
-            "text": truncate_for_telegram(text, 3900),
+            "text": truncate_for_telegram(text, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS),
             "disable_web_page_preview": true,
             "parse_mode": "HTML"
         });
@@ -279,7 +283,7 @@ impl Telegram {
                 let minutes = remaining.div_ceil(60);
                 if minutes != last_minutes {
                     last_minutes = minutes;
-                    let text = format!("{prefix}\n{} minutes left", minutes.max(1));
+                    let text = countdown_status_text(prefix, minutes.max(1));
                     telegram.try_edit_message(progress, &text).await;
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -380,6 +384,13 @@ pub fn truncate_for_telegram(value: &str, limit: usize) -> String {
     truncated
 }
 
+pub fn countdown_status_text(prefix: &str, minutes_left: u64) -> String {
+    format!(
+        "{prefix}\nAWS Lambda lifetime: {} minutes left",
+        minutes_left.max(1)
+    )
+}
+
 pub fn inline_keyboard(rows: Vec<Vec<Value>>) -> Value {
     json!({ "inline_keyboard": rows })
 }
@@ -405,4 +416,17 @@ pub fn copy_button(text: &str, copy_text: &str) -> Value {
             "text": copy_text,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::countdown_status_text;
+
+    #[test]
+    fn formats_countdown_with_lambda_lifetime() {
+        assert_eq!(
+            countdown_status_text("Downloading selected files...", 15),
+            "Downloading selected files...\nAWS Lambda lifetime: 15 minutes left"
+        );
+    }
 }

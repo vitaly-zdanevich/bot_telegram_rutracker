@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_NAME="telegram-rutracker-bot"
+WEBHOOK_BIN_NAME="telegram-rutracker-bot"
+WORKER_BIN_NAME="telegram-rutracker-worker"
 TOOLS_DIR="$ROOT_DIR/.tools"
 TARGET="aarch64-unknown-linux-gnu"
 RUST_TARGET_CPU="${RUST_TARGET_CPU:-neoverse-n1}"
@@ -11,7 +12,8 @@ SAFE_RUN_USER="${RUN_USER//[^a-zA-Z0-9_.-]/_}"
 BUILD_CACHE_DIR="$ROOT_DIR/build/cache-$SAFE_RUN_USER"
 CARGO_TARGET_DIR="$ROOT_DIR/build/target-$SAFE_RUN_USER"
 LAMBDA_DIR="$ROOT_DIR/build/lambda-$SAFE_RUN_USER"
-OUTPUT_ZIP="$ROOT_DIR/build/lambda.zip"
+WEBHOOK_OUTPUT_ZIP="$ROOT_DIR/build/lambda.zip"
+WORKER_OUTPUT_ZIP="$ROOT_DIR/build/worker.zip"
 
 mkdir -p "$BUILD_CACHE_DIR" "$CARGO_TARGET_DIR" "$LAMBDA_DIR" "$ROOT_DIR/build"
 export XDG_CACHE_HOME="$BUILD_CACHE_DIR"
@@ -88,7 +90,7 @@ fi
 CURRENT_TARGET_RUSTFLAGS="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-}"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${CURRENT_TARGET_RUSTFLAGS:+$CURRENT_TARGET_RUSTFLAGS }-C target-cpu=${RUST_TARGET_CPU}"
 
-echo "Building $BIN_NAME for $TARGET with target-cpu=$RUST_TARGET_CPU"
+echo "Building Lambda binaries for $TARGET with target-cpu=$RUST_TARGET_CPU"
 
 if cargo lambda build --help >/dev/null 2>&1; then
   CARGO_LAMBDA_BUILD=(cargo lambda build)
@@ -101,24 +103,37 @@ else
   exit 1
 fi
 
-"${CARGO_LAMBDA_BUILD[@]}" \
-  --manifest-path "$ROOT_DIR/Cargo.toml" \
-  --release \
-  --arm64 \
-  --lambda-dir "$LAMBDA_DIR" \
-  --output-format zip \
-  --bin "$BIN_NAME"
+build_lambda_bin() {
+  local bin_name="$1"
+  local output_zip="$2"
+  local bin_lambda_dir="$LAMBDA_DIR/$bin_name"
+  local zip_candidate
 
-rm -f "$OUTPUT_ZIP"
-ZIP_CANDIDATE="$LAMBDA_DIR/$BIN_NAME/bootstrap.zip"
-if [[ ! -f "$ZIP_CANDIDATE" ]]; then
-  ZIP_CANDIDATE="$(find "$LAMBDA_DIR" -maxdepth 3 -type f \( -name bootstrap.zip -o -name '*.zip' \) | sort | head -n 1)"
-fi
-if [[ -z "$ZIP_CANDIDATE" || ! -f "$ZIP_CANDIDATE" ]]; then
-  echo "cargo-lambda did not produce a Lambda zip under $LAMBDA_DIR" >&2
-  exit 1
-fi
-cp "$ZIP_CANDIDATE" "$OUTPUT_ZIP"
+  rm -rf "$bin_lambda_dir"
+  mkdir -p "$bin_lambda_dir"
 
-echo "Wrote $OUTPUT_ZIP"
-printf 'Lambda zip size: %.1f MB\n' "$(awk "BEGIN { print $(wc -c < "$OUTPUT_ZIP") / 1024 / 1024 }")"
+  "${CARGO_LAMBDA_BUILD[@]}" \
+    --manifest-path "$ROOT_DIR/Cargo.toml" \
+    --release \
+    --arm64 \
+    --lambda-dir "$bin_lambda_dir" \
+    --output-format zip \
+    --bin "$bin_name"
+
+  rm -f "$output_zip"
+  zip_candidate="$bin_lambda_dir/$bin_name/bootstrap.zip"
+  if [[ ! -f "$zip_candidate" ]]; then
+    zip_candidate="$(find "$bin_lambda_dir" -maxdepth 4 -type f \( -name bootstrap.zip -o -name '*.zip' \) | sort | head -n 1)"
+  fi
+  if [[ -z "$zip_candidate" || ! -f "$zip_candidate" ]]; then
+    echo "cargo-lambda did not produce a Lambda zip under $bin_lambda_dir" >&2
+    exit 1
+  fi
+  cp "$zip_candidate" "$output_zip"
+
+  echo "Wrote $output_zip"
+  printf '%s zip size: %.1f MB\n' "$bin_name" "$(awk "BEGIN { print $(wc -c < "$output_zip") / 1024 / 1024 }")"
+}
+
+build_lambda_bin "$WEBHOOK_BIN_NAME" "$WEBHOOK_OUTPUT_ZIP"
+build_lambda_bin "$WORKER_BIN_NAME" "$WORKER_OUTPUT_ZIP"

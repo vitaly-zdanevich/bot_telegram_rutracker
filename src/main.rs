@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lambda_http::{Error, run, service_fn};
 
-use telegram_rutracker_bot::app::handler;
+use telegram_rutracker_bot::app::webhook_handler;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -13,5 +13,5 @@ async fn main() -> Result<(), Error> {
         .without_time()
         .init();
 
-    run(service_fn(handler)).await
+    run(service_fn(webhook_handler)).await
 }

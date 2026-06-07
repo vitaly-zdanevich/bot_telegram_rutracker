@@ -11,9 +11,15 @@ variable "project_name" {
 }
 
 variable "lambda_zip" {
-  description = "Path to the Lambda deployment ZIP produced by scripts/build-lambda.sh."
+  description = "Path to the webhook Lambda deployment ZIP produced by scripts/build-lambda.sh."
   type        = string
   default     = "../build/lambda.zip"
+}
+
+variable "worker_lambda_zip" {
+  description = "Path to the worker Lambda deployment ZIP produced by scripts/build-lambda.sh."
+  type        = string
+  default     = "../build/worker.zip"
 }
 
 variable "lambda_memory_size" {

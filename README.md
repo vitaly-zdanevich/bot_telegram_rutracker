@@ -19,7 +19,7 @@ The bot uses RuTracker HTML as the primary data source because the public pages 
 - Search RuTracker titles and optionally rerun the query inside a selected category.
 - `c text` category search with subcategory buttons and 10 latest posts.
 - Per-result buttons: `Download`, `Description`, `Files`, `Magnet`, and category search.
-- `Download` asks for `All under 50 MB` or `Select`; selection uses paged toggle buttons backed by RAM cache.
+- `Download` asks for `All` or `All under 50 MB` when a known file is too large, plus `Select`; selection uses paged toggle buttons backed by RAM cache.
 - If RuTracker is unavailable from Lambda, the bot returns the official news channel link: `@rutracker_news`.
 - Description includes first-post images where Telegram can fetch them.
 - Files are parsed from the first post when available, with torrent magnet metadata fallback.
@@ -27,10 +27,11 @@ The bot uses RuTracker HTML as the primary data source because the public pages 
 - Download sends only files smaller than Telegram Bot API `sendDocument` 50 MB upload limit: https://core.telegram.org/bots/api#senddocument
 - Torrent downloads use `librqbit`, the rqbit torrent client library: https://github.com/ikatson/rqbit
 - Download sends each selected file immediately after that file is verified complete, while the torrent continues downloading the rest.
-- Download status keeps chat action alive and updates remaining minutes until Lambda's 900 second, 15 minute maximum timeout: https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html
+- Download status keeps chat action alive and updates `AWS Lambda lifetime: N minutes left` until Lambda's 900 second, 15 minute maximum timeout: https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html
 - When Lambda has only the final 10 seconds left, the bot stops waiting and reports how many files were downloaded and sent.
 - Comments after download are paged with `Next` and page markers like `1/6`.
-- Warm Lambda invocations use RAM caches for searches, topic pages, categories, latest posts, magnet metadata, and callback query text.
+- The public webhook Lambda acknowledges Telegram quickly, then invokes a private worker Lambda asynchronously.
+- Warm worker Lambda invocations use RAM caches for searches, topic pages, categories, latest posts, magnet metadata, Telegram update IDs, and callback query text.
 
 ## Architecture
 
@@ -38,7 +39,9 @@ The bot uses RuTracker HTML as the primary data source because the public pages 
 flowchart TD
     U[Telegram user] -->|message, callback, inline query| TG[Telegram Bot API]
     TG -->|webhook secret header| URL[Lambda Function URL]
-    URL --> L[AWS Lambda arm64 Rust bootstrap]
+    URL --> W[AWS Lambda arm64 Rust webhook]
+    W -->|async InvokeFunction| L[AWS Lambda arm64 Rust worker]
+    W -->|immediate 200 ok| TG
     L --> C[(RAM cache)]
     L -->|HTML search/topic/category/comments| RT[RuTracker forum]
     L -->|magnet metadata and selected downloads| BT[BitTorrent peers]
@@ -47,7 +50,7 @@ flowchart TD
 
 ## Build
 
-Lambda `arm64` currently maps to AWS Graviton2, whose core is Neoverse N1. The build config and script use `-C target-cpu=neoverse-n1` and produce an arm64 Lambda ZIP.
+Lambda `arm64` currently maps to AWS Graviton2, whose core is Neoverse N1. The build config and script use `-C target-cpu=neoverse-n1` and produce arm64 Lambda ZIPs for both webhook and worker.
 
 ```bash
 ./scripts/build-lambda.sh
@@ -59,6 +62,7 @@ Output:
 
 ```text
 build/lambda.zip
+build/worker.zip
 ```
 
 ## Deploy
@@ -80,8 +84,9 @@ The Lambda is configured for the maximum resources accepted by this AWS account 
 - `arm64`
 - `provided.al2023`
 - 3,008 MB memory by default, configurable with `lambda_memory_size` if your account supports more
-- 900 second timeout
-- 10,240 MB `/tmp`
+- webhook Lambda timeout: 30 seconds
+- worker Lambda timeout: 900 seconds
+- worker Lambda `/tmp`: 10,240 MB
 
 ## Configuration
 
@@ -89,13 +94,14 @@ Environment variables:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
+- `WORKER_FUNCTION_NAME`, set by Terraform for the webhook Lambda
 - `ALLOWED_TELEGRAM_USER_IDS`, comma-separated; empty means public
 - `RUTRACKER_BASE_URLS`, comma-separated forum base URLs tried in order; default `https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum`
 - `RUTRACKER_BASE_URL`, backward-compatible single URL fallback when `RUTRACKER_BASE_URLS` is not set
 - `RUTRACKER_USERNAME` and `RUTRACKER_PASSWORD`, optional authenticated search credentials
 - `RUTRACKER_COOKIE`, optional fallback; credentials are preferred
 - `SEARCH_LIMIT`, default `10`
-- `RUTRACKER_HTTP_MAX_ATTEMPTS`, default `2`
+- `RUTRACKER_HTTP_MAX_ATTEMPTS`, default `10`
 - `MAX_FILE_MB`, default `50`
 - `LAMBDA_TIMEOUT_SECONDS`, default `900`
 - `DOWNLOAD_MARGIN_SECONDS`, default `20`
@@ -106,6 +112,7 @@ Environment variables:
 
 ```bash
 AWS_REGION=eu-north-1 PROJECT_NAME=telegram-rutracker-bot ./scripts/show-logs.sh
+AWS_REGION=eu-north-1 FUNCTION_NAME=telegram-rutracker-bot-worker ./scripts/show-logs.sh
 ```
 
 Set `SINCE=15m` to read a shorter window.

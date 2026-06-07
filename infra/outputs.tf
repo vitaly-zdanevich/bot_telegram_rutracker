@@ -4,7 +4,11 @@ output "function_url" {
 }
 
 output "lambda_name" {
-  description = "Lambda function name."
+  description = "Webhook Lambda function name."
   value       = aws_lambda_function.bot.function_name
 }
 
+output "worker_lambda_name" {
+  description = "Worker Lambda function name."
+  value       = aws_lambda_function.worker.function_name
+}

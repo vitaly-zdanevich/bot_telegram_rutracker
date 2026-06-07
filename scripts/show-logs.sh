@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 AWS_REGION="${AWS_REGION:-eu-north-1}"
 PROJECT_NAME="${PROJECT_NAME:-telegram-rutracker-bot}"
+FUNCTION_NAME="${FUNCTION_NAME:-$PROJECT_NAME}"
 SINCE="${SINCE:-1h}"
 LIMIT="${LIMIT:-200}"
 FOLLOW="${FOLLOW:-0}"
 POLL_SECONDS="${POLL_SECONDS:-5}"
-LOG_GROUP="/aws/lambda/${PROJECT_NAME}"
+LOG_GROUP="/aws/lambda/${FUNCTION_NAME}"
 
 if aws logs tail help >/dev/null 2>&1; then
   args=(logs tail "$LOG_GROUP" --region "$AWS_REGION" --since "$SINCE")

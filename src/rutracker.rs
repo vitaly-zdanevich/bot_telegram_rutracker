@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -751,7 +751,50 @@ pub fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<SearchResu
         });
     }
 
-    Ok(results)
+    Ok(dedupe_search_results(results))
+}
+
+fn dedupe_search_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut output = Vec::with_capacity(results.len());
+    let mut indexes = HashMap::new();
+
+    for result in results {
+        if let Some(index) = indexes.get(&result.topic_id).copied() {
+            merge_search_result(&mut output[index], result);
+        } else {
+            indexes.insert(result.topic_id, output.len());
+            output.push(result);
+        }
+    }
+
+    output
+}
+
+fn merge_search_result(existing: &mut SearchResult, incoming: SearchResult) {
+    if existing.title.is_empty() {
+        existing.title = incoming.title;
+    }
+    if existing.author.is_none() {
+        existing.author = incoming.author;
+    }
+    if existing.author_profile_url.is_none() {
+        existing.author_profile_url = incoming.author_profile_url;
+    }
+    if existing.category.is_none() {
+        existing.category = incoming.category;
+    }
+    if existing.size_bytes == 0 {
+        existing.size_bytes = incoming.size_bytes;
+    }
+    if existing.seeds == 0 {
+        existing.seeds = incoming.seeds;
+    }
+    if existing.downloads == 0 {
+        existing.downloads = incoming.downloads;
+    }
+    if existing.category_url.is_none() {
+        existing.category_url = incoming.category_url;
+    }
 }
 
 fn extract_topic_id(link: ElementRef<'_>) -> Option<u64> {
