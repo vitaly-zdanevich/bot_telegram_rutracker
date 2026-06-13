@@ -40,7 +40,7 @@ Please seed legal torrents when you can; it helps the ecosystem. Respect creator
 - The public webhook Lambda tries a signed VM worker first, then falls back to a private worker Lambda when the VM is unavailable.
 - The VM worker runs beside tdlib's local `telegram-bot-api` server for 2 GB uploads instead of the public Bot API's 50 MB limit.
 - VM-only deployments can run the long-polling binary instead of the signed VM worker.
-- Warm worker Lambda invocations use RAM caches for searches, topic pages, categories, latest posts, magnet metadata, Telegram update IDs, and callback query text.
+- Warm Lambda and VM worker processes use RAM caches for searches, topic pages, categories, latest posts, magnet metadata, Telegram update IDs, and callback query text. Caches are per process and are cleared on restart or deploy.
 
 ## Architecture
 
