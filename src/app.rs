@@ -45,6 +45,7 @@ const VM_WORKER_TIMEOUT_MS_ENV: &str = "VM_WORKER_TIMEOUT_MS";
 const VM_WORKER_SIGNATURE_HEADER: &str = "x-telegram-rutracker-signature";
 const VM_WORKER_TIMESTAMP_HEADER: &str = "x-telegram-rutracker-timestamp";
 const VM_WORKER_SIGNATURE_TTL_SECONDS: u64 = 5 * 60;
+const AUTHOR_RELEASES_FORUM_ID: u64 = 1538;
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
 
@@ -57,6 +58,7 @@ static CATEGORIES_CACHE: OnceLock<CacheStore<String, Vec<crate::rutracker::Forum
 static SUBCATEGORIES_CACHE: OnceLock<CacheStore<u64, Vec<crate::rutracker::ForumNode>>> =
     OnceLock::new();
 static LATEST_CACHE: OnceLock<CacheStore<u64, Vec<SearchResult>>> = OnceLock::new();
+static VIEWFORUM_LATEST_CACHE: OnceLock<CacheStore<u64, Vec<SearchResult>>> = OnceLock::new();
 static METADATA_CACHE: OnceLock<CacheStore<u64, TorrentMetadata>> = OnceLock::new();
 static DOWNLOAD_SELECTION_CACHE: OnceLock<CacheStore<String, DownloadSelection>> = OnceLock::new();
 
@@ -502,6 +504,9 @@ impl App {
         if is_stat_command(text) {
             return self.handle_stat(chat_id).await;
         }
+        if is_author_command(text) {
+            return self.handle_author(chat_id).await;
+        }
         if let Some(query) = text.strip_prefix("c ").or_else(|| text.strip_prefix("C ")) {
             return self.handle_category_query(chat_id, query.trim()).await;
         }
@@ -509,7 +514,7 @@ impl App {
             self.telegram
                 .send_message(
                     chat_id,
-                    "Unknown command. Send /help, /stat, or a RuTracker search string.",
+                    "Unknown command. Send /help, /author, /stat, or a RuTracker search string.",
                     None,
                 )
                 .await?;
@@ -857,6 +862,45 @@ impl App {
                     .await
             }
         }
+    }
+
+    async fn handle_author(&self, chat_id: i64) -> Result<()> {
+        self.try_send_typing(chat_id).await;
+        let _typing = self.telegram.start_chat_action_heartbeat(chat_id, "typing");
+        let progress = self
+            .telegram
+            .send_status_message(chat_id, "Loading author releases...")
+            .await?;
+        let results = match self.cached_viewforum_latest(AUTHOR_RELEASES_FORUM_ID).await {
+            Ok(results) => results,
+            Err(err) => {
+                self.edit_rutracker_unavailable(progress, &err).await?;
+                return Ok(());
+            }
+        };
+        if results.is_empty() {
+            self.telegram
+                .edit_message(progress, "No recent author releases found.", None)
+                .await?;
+            return Ok(());
+        }
+        self.telegram.try_delete_message(progress).await;
+
+        for result in results {
+            let details = match self.cached_topic(result.topic_id).await {
+                Ok(details) => {
+                    ensure_same_topic(&result, &details);
+                    Some(details)
+                }
+                Err(err) => {
+                    warn!(topic_id = result.topic_id, error = %err, "failed to fetch topic details for author release");
+                    None
+                }
+            };
+            self.send_search_result(chat_id, "", &result, details.as_ref())
+                .await?;
+        }
+        Ok(())
     }
 
     async fn try_send_typing(&self, chat_id: i64) {
@@ -2045,6 +2089,22 @@ impl App {
         Ok(value)
     }
 
+    async fn cached_viewforum_latest(&self, forum_id: u64) -> Result<Vec<SearchResult>> {
+        if let Some(value) = cache_get(
+            VIEWFORUM_LATEST_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            &forum_id,
+        ) {
+            return Ok(value);
+        }
+        let value = self.rutracker.latest_in_viewforum(forum_id, 10).await?;
+        cache_set(
+            VIEWFORUM_LATEST_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            forum_id,
+            value.clone(),
+        );
+        Ok(value)
+    }
+
     async fn cached_metadata(
         &self,
         topic_id: u64,
@@ -2472,6 +2532,10 @@ fn is_stat_command(text: &str) -> bool {
     )
 }
 
+fn is_author_command(text: &str) -> bool {
+    matches!(telegram_command_name(text).as_deref(), Some("author"))
+}
+
 fn help_text(max_file_mb: u64) -> String {
     let upload_text = if max_file_mb <= crate::TELEGRAM_MAX_FILE_MB_DEFAULT {
         format!(
@@ -2494,6 +2558,7 @@ fn help_text(max_file_mb: u64) -> String {
             "This is an unofficial bot and is not affiliated with RuTracker.\n\n",
             "Send a RuTracker search string. I search rutracker.org titles and return matching topics.\n\n",
             "Use <code>c text</code> to search categories. Category buttons return the 10 most recent topics from that category.\n\n",
+            "Use <code>/author</code> to show the 10 most recent topics from RuTracker's author releases forum.\n\n",
             "Use <code>/stat</code> to show torrents currently seeding from the VM, including uploaded bytes and ratio.\n\n",
             "{}\n\n",
             "Torrent downloads use librqbit, the rqbit torrent client library: ",
@@ -2852,9 +2917,9 @@ mod tests {
         comments_text, download_prompt_reply_markup, downloaded_file_caption,
         files_from_topic_text, first_post_image_url, format_author, format_bytes,
         format_description_html, format_topic_metadata_lines, help_text, inline_keyboard,
-        mark_update_seen, message_has_files_section, message_has_section, now_seconds,
-        parse_comments_callback, remove_callback_button, resolving_files_text, seed_stats_text,
-        selection_file_button_label, telegram_command_name, topic_title_link,
+        is_author_command, mark_update_seen, message_has_files_section, message_has_section,
+        now_seconds, parse_comments_callback, remove_callback_button, resolving_files_text,
+        seed_stats_text, selection_file_button_label, telegram_command_name, topic_title_link,
         verify_vm_worker_signature, vm_worker_signature,
     };
 
@@ -2910,6 +2975,11 @@ mod tests {
             telegram_command_name("/stat@bot test").as_deref(),
             Some("stat")
         );
+        assert_eq!(
+            telegram_command_name("/author@bot").as_deref(),
+            Some("author")
+        );
+        assert!(is_author_command("/author"));
         assert_eq!(telegram_command_name("hello"), None);
     }
 
@@ -3486,6 +3556,7 @@ mod tests {
     fn help_mentions_limits_unofficial_status_and_donations() {
         let help = help_text(50);
         assert!(help.contains("https://github.com/ikatson/rqbit"));
+        assert!(help.contains("<code>/author</code>"));
         assert!(help.contains("<code>/stat</code>"));
         assert!(help.contains("Category buttons return the 10 most recent topics"));
         assert!(help.contains(

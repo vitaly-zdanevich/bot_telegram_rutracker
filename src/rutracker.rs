@@ -225,6 +225,22 @@ impl RutrackerClient {
         Ok(results)
     }
 
+    pub async fn latest_in_viewforum(
+        &self,
+        forum_id: u64,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let (html, base_url) = self
+            .get_forum_html("viewforum.php", |url| {
+                url.query_pairs_mut()
+                    .append_pair("f", &forum_id.to_string());
+            })
+            .await?;
+        let mut results = parse_viewforum_results(&html, &base_url, forum_id)?;
+        results.truncate(limit);
+        Ok(results)
+    }
+
     pub async fn topic(&self, topic_id: u64) -> Result<TopicDetails> {
         self.topic_page(topic_id, 1).await
     }
@@ -531,6 +547,18 @@ fn text(el: ElementRef<'_>) -> String {
     .to_string()
 }
 
+fn compact_text(el: ElementRef<'_>) -> String {
+    html_escape::decode_html_entities(
+        &el.text()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+    .trim()
+    .to_string()
+}
+
 fn description_text(body: ElementRef<'_>) -> String {
     let mut out = String::new();
     for node in body.descendants() {
@@ -804,6 +832,91 @@ pub fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<SearchResu
     }
 
     Ok(dedupe_search_results(results))
+}
+
+pub fn parse_viewforum_results(
+    html: &str,
+    base_url: &Url,
+    forum_id: u64,
+) -> Result<Vec<SearchResult>> {
+    let doc = Html::parse_document(html);
+    if doc_contains_login_form(&doc) {
+        bail!("RuTracker returned the login form instead of forum topics");
+    }
+
+    let category = viewforum_category(&doc, forum_id);
+    let category_url = base_url
+        .join(&format!("viewforum.php?f={forum_id}"))
+        .ok()
+        .map(|url| url.to_string());
+    let mut results = Vec::new();
+    let mut saw_section = false;
+    let mut in_topics_section = false;
+
+    for row in doc.select(&selector("table.vf-table tr, table.forumline tr")) {
+        if let Some(section) = row.select(&selector(".topicSep")).next() {
+            saw_section = true;
+            in_topics_section = text(section).trim().to_lowercase() == "темы";
+            continue;
+        }
+        if saw_section && !in_topics_section {
+            continue;
+        }
+
+        let Some(title_link) = row
+            .select(&selector(
+                ".vf-col-t-title a[href*=\"viewtopic.php?t=\"], \
+                 a.topictitle[href*=\"viewtopic.php?t=\"], \
+                 a[href*=\"viewtopic.php?t=\"]",
+            ))
+            .next()
+        else {
+            continue;
+        };
+        let Some(topic_id) = extract_topic_id(title_link) else {
+            continue;
+        };
+        let title = compact_text(title_link);
+        if title.is_empty() {
+            continue;
+        }
+
+        let topic_url = base_url
+            .join(&format!("viewtopic.php?t={topic_id}"))
+            .map(|url| url.to_string())?;
+        let (author, author_profile_url) = extract_search_author(row, base_url);
+        results.push(SearchResult {
+            topic_id,
+            title,
+            author,
+            author_profile_url,
+            category: category.clone(),
+            size_bytes: 0,
+            seeds: 0,
+            downloads: 0,
+            topic_url,
+            category_url: category_url.clone(),
+        });
+    }
+
+    Ok(dedupe_search_results(results))
+}
+
+fn viewforum_category(doc: &Html, forum_id: u64) -> Option<CategoryRef> {
+    doc.select(&selector(
+        "h1.maintitle a[href*=\"viewforum.php?f=\"], \
+         .maintitle a[href*=\"viewforum.php?f=\"], \
+         .nav a[href*=\"viewforum.php?f=\"]",
+    ))
+    .filter_map(|link| {
+        let id = link
+            .value()
+            .attr("href")
+            .and_then(extract_forum_id_from_href)?;
+        let name = text(link);
+        (id == forum_id && !name.is_empty()).then_some(CategoryRef { id, name })
+    })
+    .next()
 }
 
 fn dedupe_search_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
@@ -1859,6 +1972,72 @@ mod tests {
         assert_eq!(results[0].size_bytes, 41_943_040);
         assert_eq!(results[0].seeds, 17);
         assert_eq!(results[0].downloads, 420);
+    }
+
+    #[test]
+    fn parses_viewforum_topics_after_topics_section() {
+        let html = r#"
+            <h1 class="maintitle"><a href="viewforum.php?f=1538">Авторские раздачи</a></h1>
+            <table class="vf-table forumline">
+                <tr><td class="topicSep">Объявления</td></tr>
+                <tr class="hl-tr" data-topic_id="3044518">
+                    <td class="vf-col-t-title">
+                        <a href="viewtopic.php?t=3044518" class="topictitle tt-text">FAQ</a>
+                    </td>
+                    <td class="vf-col-author"><a href="profile.php?mode=viewprofile&amp;u=1">moderator</a></td>
+                </tr>
+                <tr><td class="topicSep">Прилеплены</td></tr>
+                <tr class="hl-tr" data-topic_id="6828883">
+                    <td class="vf-col-t-title">
+                        <a href="viewtopic.php?t=6828883" class="topictitle tt-text">Pinned release</a>
+                    </td>
+                    <td class="vf-col-author"><a href="profile.php?mode=viewprofile&amp;u=2">curator</a></td>
+                </tr>
+                <tr><td class="topicSep">Темы</td></tr>
+                <tr class="hl-tr" data-topic_id="6860489">
+                    <td class="vf-col-t-title">
+                        <a href="viewtopic.php?t=6860489" class="topictitle tt-text">(Techno-Folk<wbr>) ROOKAVA - 9 singles - 2025-2026</a>
+                    </td>
+                    <td class="vf-col-author"><a href="profile.php?mode=viewprofile&amp;u=1081791">hagnir</a></td>
+                </tr>
+                <tr class="hl-tr" data-topic_id="6860487">
+                    <td class="vf-col-t-title">
+                        <a href="viewtopic.php?t=6860487" class="topictitle tt-text">(parody/folk<wbr>) The StarПёры - Ничего святого - 2026</a>
+                    </td>
+                    <td class="vf-col-author"><a href="profile.php?mode=viewprofile&amp;u=1081791">hagnir</a></td>
+                </tr>
+            </table>
+        "#;
+
+        let results = parse_viewforum_results(html, &base(), 1538).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].topic_id, 6860489);
+        assert_eq!(
+            results[0].title,
+            "(Techno-Folk) ROOKAVA - 9 singles - 2025-2026"
+        );
+        assert_eq!(results[0].author.as_deref(), Some("hagnir"));
+        assert!(
+            results[0]
+                .author_profile_url
+                .as_ref()
+                .unwrap()
+                .contains("profile.php?mode=viewprofile")
+        );
+        assert_eq!(results[0].category.as_ref().unwrap().id, 1538);
+        assert_eq!(
+            results[0].category.as_ref().unwrap().name,
+            "Авторские раздачи"
+        );
+        assert!(
+            results[0]
+                .category_url
+                .as_ref()
+                .unwrap()
+                .ends_with("f=1538")
+        );
+        assert_eq!(results[1].topic_id, 6860487);
     }
 
     #[test]
