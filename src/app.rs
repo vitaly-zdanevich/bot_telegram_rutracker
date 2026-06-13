@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -16,51 +16,38 @@ use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::downloader::{DownloadRequest, TorrentDownloader};
+use crate::downloader::{
+    DownloadOutcome, DownloadRequest, SeedConfig, SeedTorrentStats, TorrentDownloader,
+};
 use crate::rutracker::{
-    AuthorDetails, RutrackerClient, RutrackerCredentials, SearchResult, TopicDetails, TopicFile,
-    ensure_same_topic, require_magnet, validate_forum_query,
+    AuthorDetails, RutrackerClient, RutrackerCredentials, SearchResult, TopicComment, TopicDetails,
+    TopicFile, ensure_same_topic, require_magnet, validate_forum_query,
 };
 use crate::telegram::{
-    CallbackQuery, InlineQuery, Message, ProgressMessage, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS,
-    Telegram, Update, callback_button, copy_button, countdown_status_text, html_escape,
-    inline_keyboard, truncate_for_telegram, url_button,
+    CallbackQuery, InlineQuery, Message, ProgressMessage, TELEGRAM_CAPTION_LIMIT_CHARS,
+    TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, Telegram, Update, callback_button, copy_button,
+    countdown_status_text, html_escape, inline_keyboard, truncate_for_telegram, url_button,
 };
 use crate::telegram_safe_file_bytes;
 use crate::torrent::{TorrentFile, TorrentMetadata};
 
-const HELP_TEXT: &str = concat!(
-    "This is an unofficial bot and is not affiliated with RuTracker.\n\n",
-    "Send a RuTracker search string. I search rutracker.org titles and return matching topics.\n\n",
-    "Use <code>c text</code> to search categories. Category buttons from normal search results rerun the same query inside that category.\n\n",
-    "Downloads are limited to files under 50 MB because Telegram Bot API ",
-    "<a href=\"https://core.telegram.org/bots/api#senddocument\">sendDocument</a> has that upload limit.\n\n",
-    "Torrent downloads use librqbit, the rqbit torrent client library: ",
-    "https://github.com/ikatson/rqbit\n\n",
-    "AWS Lambda can run one invocation for at most 15 minutes: ",
-    "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
-    "If RuTracker is unavailable, I return the official news channel link: @rutracker_news. ",
-    "RuTracker runs on low-cost community infrastructure; please consider donating to them.\n\n",
-    "Please seed legal torrents when you can; it helps the ecosystem. ",
-    "Respect creators, and consider supporting your favorite artists and authors with money or by buying from them. ",
-    "Torrents are also culture preservation: many works are public domain, Creative Commons, abandoned, or otherwise unavailable to buy legally.\n\n",
-    "If you know an indie artist, consider asking whether they want to release some work under Creative Commons and publish it legally on RuTracker, so more people can discover them.\n\n",
-    "Source code: https://github.com/vitaly-zdanevich/bot_telegram_rutracker"
-);
-
 const RUTRACKER_NEWS_URL: &str = "https://t.me/rutracker_news";
 const RUTRACKER_UNAVAILABLE_TEXT: &str = concat!(
-    "RuTracker is unavailable from this Lambda right now. ",
+    "RuTracker is unavailable from this bot backend right now. ",
     "Check their official news channel for status: ",
     "<a href=\"https://t.me/rutracker_news\">@rutracker_news</a>.\n",
     "RuTracker runs on low-cost community infrastructure; please consider donating to them."
 );
 const WORKER_FUNCTION_NAME_ENV: &str = "WORKER_FUNCTION_NAME";
-const DOWNLOAD_PROMPT_TEXT: &str = "<b>Download</b>\nChoose all files under 50 MB, or select specific files from torrent metadata.";
+const VM_WORKER_URL_ENV: &str = "VM_WORKER_URL";
+const VM_WORKER_SECRET_ENV: &str = "VM_WORKER_SECRET";
+const VM_WORKER_TIMEOUT_MS_ENV: &str = "VM_WORKER_TIMEOUT_MS";
+const VM_WORKER_SIGNATURE_HEADER: &str = "x-telegram-rutracker-signature";
+const VM_WORKER_TIMESTAMP_HEADER: &str = "x-telegram-rutracker-timestamp";
+const VM_WORKER_SIGNATURE_TTL_SECONDS: u64 = 5 * 60;
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
 
-static QUERY_CACHE: OnceLock<Mutex<HashMap<String, QueryCacheEntry>>> = OnceLock::new();
 static UPDATE_CACHE: OnceLock<CacheStore<i64, ()>> = OnceLock::new();
 static SEARCH_CACHE: OnceLock<CacheStore<String, Vec<SearchResult>>> = OnceLock::new();
 static TOPIC_CACHE: OnceLock<CacheStore<u64, TopicDetails>> = OnceLock::new();
@@ -75,12 +62,7 @@ static DOWNLOAD_SELECTION_CACHE: OnceLock<CacheStore<String, DownloadSelection>>
 
 const RAM_CACHE_TTL_SECONDS: u64 = 30 * 60;
 const SELECTION_PAGE_SIZE: usize = 8;
-
-#[derive(Clone)]
-struct QueryCacheEntry {
-    query: String,
-    created_at: u64,
-}
+const SELECTION_FILE_BUTTON_LABEL_CHARS: usize = 48;
 
 #[derive(Clone)]
 struct CacheEntry<T> {
@@ -124,6 +106,14 @@ pub async fn webhook_handler(request: Request) -> Result<impl IntoResponse, Erro
             return Ok(response(StatusCode::OK, "ignored"));
         }
     };
+    if forward_to_vm_worker_if_configured(payload.clone()).await? {
+        info!(
+            update_id = update.update_id,
+            "forwarded Telegram update to VM worker"
+        );
+        return Ok(response(StatusCode::OK, "ok"));
+    }
+
     let worker_function_name = crate::config::required_env(WORKER_FUNCTION_NAME_ENV)?;
     invoke_worker(&worker_function_name, payload).await?;
     info!(
@@ -134,6 +124,8 @@ pub async fn webhook_handler(request: Request) -> Result<impl IntoResponse, Erro
     Ok(response(StatusCode::OK, "ok"))
 }
 
+/// Handles the private Lambda worker payload after the webhook Lambda has
+/// already acknowledged Telegram.
 pub async fn handle_worker_payload(payload: Value) -> Result<Value> {
     let update: Update = serde_json::from_value(payload).context("failed to parse worker event")?;
     let config = Config::from_env()?;
@@ -145,9 +137,122 @@ pub async fn handle_worker_payload(payload: Value) -> Result<Value> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
+/// Handles a signed update forwarded from the public Lambda webhook to the VM.
+///
+/// The VM endpoint returns 2xx quickly and processes the Telegram update in the
+/// background, so Lambda does not retry and duplicate the same user-visible work.
+pub async fn handle_vm_worker_payload(
+    payload: &[u8],
+    timestamp: &str,
+    signature: &str,
+) -> Result<Value> {
+    validate_vm_worker_payload(payload, timestamp, signature)?;
+    let update = parse_update_bytes(payload)?;
+    let config = Config::from_env()?;
+    let app = App::new(config)?;
+    if let Err(err) = app.handle_update(update).await {
+        error!(error = %err, "failed to handle Telegram update on VM worker");
+    }
+
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Verifies that a VM worker request came from the Lambda webhook dispatcher.
+pub fn validate_vm_worker_payload(payload: &[u8], timestamp: &str, signature: &str) -> Result<()> {
+    let secret = crate::config::required_env(VM_WORKER_SECRET_ENV)?;
+    verify_vm_worker_signature(&secret, timestamp, signature, payload)
+}
+
+/// Runs the same bot app through Telegram long polling for VM-only deployments.
+pub async fn run_polling_from_env() -> Result<()> {
+    let config = Config::from_env()?;
+    let app = App::new(config)?;
+    app.run_polling().await
+}
+
+/// Returns true when the VM worker accepted the update and Lambda should not
+/// invoke the fallback worker.
+async fn forward_to_vm_worker_if_configured(payload: Vec<u8>) -> Result<bool> {
+    let Some(url) = crate::config::optional_env(VM_WORKER_URL_ENV) else {
+        return Ok(false);
+    };
+    let secret = crate::config::required_env(VM_WORKER_SECRET_ENV)?;
+    let timeout_ms = crate::config::parse_env(VM_WORKER_TIMEOUT_MS_ENV, 1500_u64)?;
+    let timestamp = now_seconds().to_string();
+    let signature = vm_worker_signature(&secret, &timestamp, &payload)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .context("failed to build VM worker HTTP client")?;
+    let response = client
+        .post(&url)
+        .header(VM_WORKER_TIMESTAMP_HEADER, timestamp)
+        .header(VM_WORKER_SIGNATURE_HEADER, signature)
+        .body(payload)
+        .send()
+        .await;
+
+    match response {
+        Ok(response) if response.status().is_success() => Ok(true),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            warn!(%status, body = %body, "VM worker rejected Telegram update; falling back to Lambda worker");
+            Ok(false)
+        }
+        Err(err) => {
+            warn!(error = %err, "VM worker unavailable; falling back to Lambda worker");
+            Ok(false)
+        }
+    }
+}
+
 async fn invoke_worker(function_name: &str, payload: Vec<u8>) -> Result<(), Error> {
     invoke_worker_signed(function_name, payload).await?;
     Ok(())
+}
+
+fn vm_worker_signature(secret: &str, timestamp: &str, payload: &[u8]) -> Result<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .context("failed to create VM worker HMAC")?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(payload);
+    Ok(format!(
+        "sha256={}",
+        hex_lower(&mac.finalize().into_bytes())
+    ))
+}
+
+fn verify_vm_worker_signature(
+    secret: &str,
+    timestamp: &str,
+    signature: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let timestamp_seconds = timestamp
+        .parse::<u64>()
+        .context("VM worker timestamp is invalid")?;
+    let now = now_seconds();
+    if now.abs_diff(timestamp_seconds) > VM_WORKER_SIGNATURE_TTL_SECONDS {
+        bail!("VM worker signature timestamp is stale");
+    }
+    let expected = vm_worker_signature(secret, timestamp, payload)?;
+    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        bail!("VM worker signature is invalid");
+    }
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 // Avoid the full AWS SDK here: the webhook only needs one signed Invoke call,
@@ -294,7 +399,10 @@ struct App {
 
 impl App {
     fn new(config: Config) -> Result<Self> {
-        let telegram = Telegram::new(config.telegram_bot_token.clone());
+        let telegram = Telegram::new(
+            config.telegram_bot_token.clone(),
+            config.telegram_api_base_url.clone(),
+        );
         let rutracker_credentials = match (
             config.rutracker_username.as_deref(),
             config.rutracker_password.as_deref(),
@@ -340,6 +448,31 @@ impl App {
         Ok(())
     }
 
+    async fn run_polling(&self) -> Result<()> {
+        self.telegram
+            .delete_webhook()
+            .await
+            .context("failed to delete Telegram webhook before polling")?;
+        info!("started Telegram long polling");
+        let mut offset = None;
+        loop {
+            match self.telegram.get_updates(offset, 50).await {
+                Ok(updates) => {
+                    for update in updates {
+                        offset = Some(update.update_id + 1);
+                        if let Err(err) = self.handle_update(update).await {
+                            error!(error = %err, "failed to handle Telegram update");
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "Telegram long polling failed");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
     async fn handle_message(&self, message: Message) -> Result<()> {
         let chat_id = message.chat.id;
         if !self.is_allowed_user(message.from.as_ref().map(|user| user.id)) {
@@ -361,8 +494,13 @@ impl App {
         };
 
         if is_help_command(text) {
-            self.telegram.send_message(chat_id, HELP_TEXT, None).await?;
+            self.telegram
+                .send_message(chat_id, &help_text(self.config.max_file_mb), None)
+                .await?;
             return Ok(());
+        }
+        if is_stat_command(text) {
+            return self.handle_stat(chat_id).await;
         }
         if let Some(query) = text.strip_prefix("c ").or_else(|| text.strip_prefix("C ")) {
             return self.handle_category_query(chat_id, query.trim()).await;
@@ -371,7 +509,7 @@ impl App {
             self.telegram
                 .send_message(
                     chat_id,
-                    "Unknown command. Send /help or a RuTracker search string.",
+                    "Unknown command. Send /help, /stat, or a RuTracker search string.",
                     None,
                 )
                 .await?;
@@ -489,11 +627,19 @@ impl App {
                 .await?;
             return self.handle_magnet(chat_id, topic_id).await;
         }
-        if let Some((topic_id, page)) = parse_comments_callback(data) {
+        if let Some((topic_id, page, start_comment_index)) = parse_comments_callback(data) {
             self.telegram
                 .answer_callback(&callback.id, "Loading comments...")
                 .await?;
-            return self.send_comments_page(chat_id, topic_id, page).await;
+            return self
+                .send_comments_page(
+                    chat_id,
+                    topic_id,
+                    page,
+                    start_comment_index,
+                    callback_message,
+                )
+                .await;
         }
         if let Some(forum_id) = data.strip_prefix("cat:").and_then(parse_u64) {
             self.telegram
@@ -507,23 +653,10 @@ impl App {
                 .next()
                 .and_then(parse_u64)
                 .ok_or_else(|| anyhow!("invalid category search callback"))?;
-            let key = parts
-                .next()
-                .ok_or_else(|| anyhow!("category search callback missing cache key"))?;
-            let Some(query) = load_query_cache(key) else {
-                self.telegram
-                    .send_message(
-                        chat_id,
-                        "That category filter expired after a Lambda cold start. Send the search again.",
-                        None,
-                    )
-                    .await?;
-                return Ok(());
-            };
             self.telegram
-                .answer_callback(&callback.id, "Searching inside category...")
+                .answer_callback(&callback.id, "Loading category...")
                 .await?;
-            return self.run_search(chat_id, &query, Some(forum_id)).await;
+            return self.handle_category(chat_id, forum_id).await;
         }
 
         Ok(())
@@ -613,11 +746,11 @@ impl App {
             .map(|lines| format!("{lines}\n"))
             .unwrap_or_default();
         let message_text = format!(
-            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            "{}\nCategory: {}\nUser: {}\n{}Size: {}\nSeeds: {}\nDownloads: {}",
             topic_title_link(title, &result.topic_url),
             category_line,
-            metadata_lines,
             author,
+            metadata_lines,
             format_bytes(size),
             seeds,
             downloads,
@@ -631,12 +764,12 @@ impl App {
             && let Some(category) = result.category.as_ref()
         {
             buttons.push(vec![callback_button(
-                "Search in category",
-                &category_search_callback(category.id, query),
+                &format!("Category: {}", truncate_button_text(&category.name, 50)),
+                &category_latest_callback(category.id),
             )]);
         }
 
-        Ok(serde_json::json!({
+        let mut article = serde_json::json!({
             "type": "article",
             "id": result.topic_id.to_string(),
             "title": title,
@@ -647,7 +780,11 @@ impl App {
                 "disable_web_page_preview": true,
             },
             "reply_markup": inline_keyboard(buttons),
-        }))
+        });
+        if let Some(image) = first_post_image_url(details) {
+            article["thumbnail_url"] = serde_json::json!(image);
+        }
+        Ok(article)
     }
 
     async fn run_search(&self, chat_id: i64, query: &str, forum_id: Option<u64>) -> Result<()> {
@@ -688,6 +825,38 @@ impl App {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn handle_stat(&self, chat_id: i64) -> Result<()> {
+        let Some(seed_config) = self.seed_config() else {
+            self.telegram
+                .send_message(
+                    chat_id,
+                    "Torrent seeding is disabled for this backend.",
+                    None,
+                )
+                .await?;
+            return Ok(());
+        };
+        match TorrentDownloader::seed_stats(seed_config, self.config.peer_limit).await {
+            Ok(stats) => {
+                self.telegram
+                    .send_message(chat_id, &seed_stats_text(&stats), None)
+                    .await
+            }
+            Err(err) => {
+                self.telegram
+                    .send_message(
+                        chat_id,
+                        &format!(
+                            "Cannot read torrent stats: {}",
+                            html_escape(&err.to_string())
+                        ),
+                        None,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn try_send_typing(&self, chat_id: i64) {
@@ -743,11 +912,11 @@ impl App {
             .unwrap_or_default();
 
         let message = format!(
-            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            "{}\nCategory: {}\nUser: {}\n{}Size: {}\nSeeds: {}\nDownloads: {}",
             topic_title_link(title, &result.topic_url),
             category_line,
-            metadata_lines,
             author,
+            metadata_lines,
             format_bytes(size),
             seeds,
             downloads,
@@ -756,6 +925,7 @@ impl App {
         let mut rows = vec![
             vec![
                 callback_button("Description", &format!("desc:{}", result.topic_id)),
+                callback_button("Comments", &format!("comments:{}:1", result.topic_id)),
                 callback_button("Files", &format!("files:{}", result.topic_id)),
             ],
             vec![
@@ -766,12 +936,31 @@ impl App {
         if let Some(category) = category.filter(|_| !query.is_empty()) {
             rows.push(vec![callback_button(
                 &format!("Category: {}", truncate_button_text(&category.name, 50)),
-                &category_search_callback(category.id, query),
+                &category_latest_callback(category.id),
             )]);
         }
 
+        let reply_markup = inline_keyboard(rows);
+        if let Some(image) = first_post_image_url(details) {
+            match self
+                .telegram
+                .send_photo_url_or_upload(chat_id, image, None, None)
+                .await
+            {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(
+                        topic_id = result.topic_id,
+                        image,
+                        error = %err,
+                        "failed to send search result image; sending metadata without image"
+                    );
+                }
+            }
+        }
+
         self.telegram
-            .send_message(chat_id, &message, Some(inline_keyboard(rows)))
+            .send_message(chat_id, &message, Some(reply_markup))
             .await
     }
 
@@ -807,7 +996,7 @@ impl App {
                     .map(|node| {
                         callback_button(
                             &truncate_button_text(&node.name, 60),
-                            &format!("cat:{}", node.id),
+                            &category_latest_callback(node.id),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -840,7 +1029,7 @@ impl App {
                         .map(|node| {
                             callback_button(
                                 &truncate_button_text(&node.name, 60),
-                                &format!("cat:{}", node.id),
+                                &category_latest_callback(node.id),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -895,7 +1084,7 @@ impl App {
         } else {
             self.topic_message_with_description(
                 &topic,
-                &html_escape(&truncate_for_telegram(&topic.description_text, 3000)),
+                &format_description_html(&truncate_for_telegram(&topic.description_text, 3000)),
             )?
         };
         let reply_markup = remove_callback_button(reply_markup, &format!("desc:{topic_id}"));
@@ -905,22 +1094,6 @@ impl App {
                 .await?;
         } else {
             self.telegram.send_message(chat_id, &text, None).await?;
-        }
-        for image in topic.first_post_images.iter().take(10) {
-            if let Err(err) = self
-                .telegram
-                .send_photo_url(chat_id, image, None, None)
-                .await
-            {
-                warn!(topic_id, image, error = %err, "failed to send description image");
-                self.telegram
-                    .send_message(
-                        chat_id,
-                        &format!("Image: <a href=\"{}\">open</a>", html_escape(image)),
-                        None,
-                    )
-                    .await?;
-            }
         }
         Ok(())
     }
@@ -968,11 +1141,11 @@ impl App {
             .unwrap_or_else(|| "unknown".to_string());
 
         Ok(format!(
-            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}\n\n<b>Description</b>\n{}",
+            "{}\nCategory: {}\nUser: {}\n{}Size: {}\nSeeds: {}\nDownloads: {}\n\n<b>Description</b>\n{}",
             topic_title_link(title, &self.rutracker.topic_url(topic.topic_id)?),
             category_line,
-            metadata_block,
             author,
+            metadata_block,
             size,
             seeds,
             downloads,
@@ -987,7 +1160,7 @@ impl App {
         include_description: bool,
     ) -> Result<String> {
         let description = if include_description && !topic.description_text.is_empty() {
-            Some(html_escape(&truncate_for_telegram(
+            Some(format_description_html(&truncate_for_telegram(
                 &topic.description_text,
                 2400,
             )))
@@ -1042,11 +1215,11 @@ impl App {
             .unwrap_or_else(|| "unknown".to_string());
 
         Ok(format!(
-            "{}\nCategory: {}\n{}Author: {}\nSize: {}\nSeeds: {}\nDownloads: {}",
+            "{}\nCategory: {}\nUser: {}\n{}Size: {}\nSeeds: {}\nDownloads: {}",
             topic_title_link(title, &self.rutracker.topic_url(topic.topic_id)?),
             category_line,
-            metadata_block,
             author,
+            metadata_block,
             size,
             seeds,
             downloads
@@ -1090,16 +1263,25 @@ impl App {
 
         let magnet = require_magnet(&topic)?;
         let downloader = self.downloader(topic_id);
-        let progress = self
-            .telegram
-            .send_status_message(chat_id, "Resolving magnet metadata for file list...")
-            .await?;
+        let progress = match message_to_edit {
+            Some(progress) => {
+                let resolving_text = resolving_files_text(current_text.as_deref());
+                self.telegram
+                    .edit_message(progress, &resolving_text, reply_markup.clone())
+                    .await?;
+                progress
+            }
+            None => {
+                self.telegram
+                    .send_status_message(chat_id, "Resolving magnet metadata for file list...")
+                    .await?
+            }
+        };
         match self
             .cached_metadata(topic_id, magnet, &downloader, 120)
             .await
         {
             Ok(metadata) => {
-                self.telegram.try_delete_message(progress).await;
                 let files = files_from_metadata_text(&metadata.files, self.config.max_file_mb);
                 let text = self.topic_message_with_files(&topic, &files, include_description)?;
                 if let Some(message_to_edit) = message_to_edit {
@@ -1107,6 +1289,7 @@ impl App {
                         .edit_message(message_to_edit, &text, reply_markup)
                         .await?;
                 } else {
+                    self.telegram.try_delete_message(progress).await;
                     self.telegram.send_message(chat_id, &text, None).await?;
                 }
             }
@@ -1183,11 +1366,8 @@ impl App {
             include_description,
             existing_files.as_deref(),
         )?;
-        let reply_markup = download_prompt_reply_markup(
-            reply_markup,
-            topic_id,
-            all_files_button_label(&topic, self.config.max_file_mb),
-        );
+        let all_files_label = all_files_button_label(&topic, self.config.max_file_mb);
+        let reply_markup = download_prompt_reply_markup(reply_markup, topic_id, &all_files_label);
         if let Some(progress) = progress {
             self.telegram
                 .edit_message(progress, &text, reply_markup)
@@ -1208,19 +1388,20 @@ impl App {
         let mut text = if include_description && !topic.description_text.is_empty() {
             self.topic_message_with_description(
                 topic,
-                &html_escape(&truncate_for_telegram(&topic.description_text, 2400)),
+                &format_description_html(&truncate_for_telegram(&topic.description_text, 2400)),
             )?
         } else {
             self.topic_message_header(topic)?
         };
         if let Some(existing_files) = existing_files {
-            let with_files = format!("{text}\n\n{existing_files}\n\n{DOWNLOAD_PROMPT_TEXT}");
+            let download_prompt = download_prompt_text(self.config.max_file_mb);
+            let with_files = format!("{text}\n\n{existing_files}\n\n{download_prompt}");
             if with_files.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
                 return Ok(with_files);
             }
         }
         text.push_str("\n\n");
-        text.push_str(DOWNLOAD_PROMPT_TEXT);
+        text.push_str(&download_prompt_text(self.config.max_file_mb));
         Ok(text)
     }
 
@@ -1245,23 +1426,26 @@ impl App {
         topic_id: u64,
         progress: Option<ProgressMessage>,
     ) -> Result<()> {
-        let progress = match progress {
+        let (progress, preserve_message_body) = match progress {
             Some(progress) => {
-                self.telegram
-                    .try_edit_message(progress, "Resolving magnet metadata for file selection...")
-                    .await;
-                progress
+                self.try_send_typing(chat_id).await;
+                (progress, true)
             }
-            None => {
+            None => (
                 self.telegram
                     .send_status_message(chat_id, "Resolving magnet metadata for file selection...")
-                    .await?
-            }
+                    .await?,
+                false,
+            ),
         };
         let topic = match self.cached_topic(topic_id).await {
             Ok(topic) => topic,
             Err(err) => {
-                self.edit_rutracker_unavailable(progress, &err).await?;
+                if preserve_message_body {
+                    self.send_rutracker_unavailable(chat_id, &err).await?;
+                } else {
+                    self.edit_rutracker_unavailable(progress, &err).await?;
+                }
                 return Ok(());
             }
         };
@@ -1273,27 +1457,28 @@ impl App {
         {
             Ok(metadata) => metadata,
             Err(err) => {
-                self.telegram
-                    .edit_message(
-                        progress,
-                        &format!(
-                            "Cannot load torrent metadata for selection: {}",
-                            html_escape(&err.to_string())
-                        ),
-                        None,
-                    )
-                    .await?;
+                let text = format!(
+                    "Cannot load torrent metadata for selection: {}",
+                    html_escape(&err.to_string())
+                );
+                if preserve_message_body {
+                    self.telegram.send_message(chat_id, &text, None).await?;
+                } else {
+                    self.telegram.edit_message(progress, &text, None).await?;
+                }
                 return Ok(());
             }
         };
         if selectable_files(&metadata, self.config.max_file_mb).is_empty() {
-            self.telegram
-                .edit_message(
-                    progress,
-                    "No files smaller than Telegram's 50 MB bot upload limit are available for selection.",
-                    None,
-                )
-                .await?;
+            let text = format!(
+                "No files smaller than the configured {} Telegram upload limit are available for selection.",
+                upload_limit_label(self.config.max_file_mb)
+            );
+            if preserve_message_body {
+                self.telegram.send_message(chat_id, &text, None).await?;
+            } else {
+                self.telegram.edit_message(progress, &text, None).await?;
+            }
             return Ok(());
         }
         let key = store_download_selection(DownloadSelection {
@@ -1326,11 +1511,7 @@ impl App {
         let metadata = match self.cached_selection_metadata(&selection).await {
             Ok(metadata) => metadata,
             Err(err) => {
-                if let Some(progress) = progress {
-                    self.edit_rutracker_unavailable(progress, &err).await?;
-                } else {
-                    self.send_rutracker_unavailable(chat_id, &err).await?;
-                }
+                self.send_rutracker_unavailable(chat_id, &err).await?;
                 return Ok(());
             }
         };
@@ -1362,11 +1543,7 @@ impl App {
         let metadata = match self.cached_selection_metadata(&selection).await {
             Ok(metadata) => metadata,
             Err(err) => {
-                if let Some(progress) = progress {
-                    self.edit_rutracker_unavailable(progress, &err).await?;
-                } else {
-                    self.send_rutracker_unavailable(chat_id, &err).await?;
-                }
+                self.send_rutracker_unavailable(chat_id, &err).await?;
                 return Ok(());
             }
         };
@@ -1443,8 +1620,8 @@ impl App {
     ) -> Result<()> {
         let Some(selection) = load_download_selection(key) else {
             self.telegram
-                .edit_message(
-                    progress,
+                .send_message(
+                    progress.chat_id,
                     "This file selection expired. Press Download again.",
                     None,
                 )
@@ -1465,52 +1642,13 @@ impl App {
         }
         let start = page * SELECTION_PAGE_SIZE;
         let end = (start + SELECTION_PAGE_SIZE).min(files.len());
-        let mut text = format!(
-            "<b>Select files {}/{}</b>\nSelected: {} of {}\n\n",
-            page + 1,
-            total_pages,
-            selection.selected.len(),
-            files.len()
-        );
-        for (offset, file) in files[start..end].iter().enumerate() {
-            let number = start + offset + 1;
-            let mark = if selection.selected.contains(&file.index) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            text.push_str(&format!(
-                "{} {}. {} - {}\n",
-                mark,
-                number,
-                html_escape(&truncate_for_telegram(&file.path.display().to_string(), 70)),
-                format_bytes(file.size_bytes)
-            ));
-        }
-        text.push_str(
-            "\nFiles over 50 MB are not selectable here. Use Files to view the full list.",
-        );
 
         let mut rows = Vec::new();
-        let mut number_row = Vec::new();
-        for (offset, file) in files[start..end].iter().enumerate() {
-            let number = start + offset + 1;
-            let mark = if selection.selected.contains(&file.index) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            number_row.push(callback_button(
-                &format!("{mark} {number}"),
+        for file in &files[start..end] {
+            rows.push(vec![callback_button(
+                &selection_file_button_label(file, selection.selected.contains(&file.index)),
                 &format!("tog:{key}:{}", file.index),
-            ));
-            if number_row.len() == 4 {
-                rows.push(number_row);
-                number_row = Vec::new();
-            }
-        }
-        if !number_row.is_empty() {
-            rows.push(number_row);
+            )]);
         }
         let mut nav = Vec::new();
         if page > 0 {
@@ -1523,12 +1661,12 @@ impl App {
             rows.push(nav);
         }
         rows.push(vec![callback_button(
-            "Start selected",
+            &format!("Start selected ({})", selection.selected.len()),
             &format!("go:{key}"),
         )]);
 
         self.telegram
-            .edit_message(progress, &text, Some(inline_keyboard(rows)))
+            .edit_message_reply_markup(progress, Some(inline_keyboard(rows)))
             .await
     }
 
@@ -1547,6 +1685,8 @@ impl App {
         let countdown = self.telegram.start_status_countdown(
             progress,
             "Downloading selected files...",
+            self.config.download_countdown_label.clone(),
+            self.config.download_status_interval_seconds,
             total_seconds,
         );
 
@@ -1601,11 +1741,16 @@ impl App {
         self.telegram
             .try_edit_message(
                 progress,
-                &countdown_status_text("Downloading selected files...", 15),
+                &countdown_status_text(
+                    "Downloading selected files...",
+                    &self.config.download_countdown_label,
+                    total_seconds.div_ceil(60),
+                ),
             )
             .await;
         let telegram = self.telegram.clone();
         let title = topic.title.clone();
+        let topic_url = self.rutracker.topic_url(topic.topic_id)?;
         let outcome = match downloader
             .download_small_files(
                 DownloadRequest {
@@ -1619,20 +1764,17 @@ impl App {
                 move |file, completed, total| {
                     let telegram = telegram.clone();
                     let title = title.clone();
+                    let topic_url = topic_url.clone();
                     async move {
+                        let caption = downloaded_file_caption(
+                            &title,
+                            &topic_url,
+                            file.size_bytes,
+                            completed,
+                            total,
+                        );
                         telegram
-                            .send_document(
-                                chat_id,
-                                &file.path,
-                                &file.display_name,
-                                Some(&format!(
-                                    "{} ({}) - file {}/{}",
-                                    title,
-                                    format_bytes(file.size_bytes),
-                                    completed,
-                                    total
-                                )),
-                            )
+                            .send_document(chat_id, &file.path, &file.display_name, Some(&caption))
                             .await
                     }
                 },
@@ -1650,7 +1792,6 @@ impl App {
                         None,
                     )
                     .await?;
-                self.send_comments(chat_id, &topic).await?;
                 return Ok(());
             }
         };
@@ -1661,11 +1802,7 @@ impl App {
             self.telegram
                 .edit_message(
                     progress,
-                    &format!(
-                        "Downloaded and sent {} of {} files - sorry, AWS Lambda lifetime is only 15 minutes.",
-                        outcome.files.len(),
-                        outcome.total_files
-                    ),
+                    &download_timeout_message(&self.config, &outcome),
                     None,
                 )
                 .await?;
@@ -1673,7 +1810,10 @@ impl App {
             self.telegram
                 .edit_message(
                     progress,
-                    "No files smaller than Telegram's 50 MB bot upload limit were downloaded.",
+                    &format!(
+                        "No files smaller than the configured {} Telegram upload limit were downloaded.",
+                        upload_limit_label(self.config.max_file_mb)
+                    ),
                     None,
                 )
                 .await?;
@@ -1688,15 +1828,17 @@ impl App {
             self.telegram.try_delete_message(progress).await;
         }
 
-        self.send_comments(chat_id, &topic).await?;
         Ok(())
     }
 
-    async fn send_comments(&self, chat_id: i64, topic: &TopicDetails) -> Result<()> {
-        self.send_comments_topic(chat_id, topic).await
-    }
-
-    async fn send_comments_page(&self, chat_id: i64, topic_id: u64, page: u32) -> Result<()> {
+    async fn send_comments_page(
+        &self,
+        chat_id: i64,
+        topic_id: u64,
+        page: u32,
+        start_comment_index: usize,
+        callback_message: Option<ProgressMessage>,
+    ) -> Result<()> {
         let topic = match self.cached_topic_page(topic_id, page).await {
             Ok(topic) => topic,
             Err(err) => {
@@ -1704,41 +1846,64 @@ impl App {
                 return Ok(());
             }
         };
-        self.send_comments_topic(chat_id, &topic).await
+        self.send_comments_topic(chat_id, &topic, start_comment_index, callback_message)
+            .await
     }
 
-    async fn send_comments_topic(&self, chat_id: i64, topic: &TopicDetails) -> Result<()> {
-        let page = topic.comments_page.max(1);
-        let total_pages = topic.comments_total_pages.max(page).max(1);
-        if topic.comments.is_empty() {
-            self.telegram
-                .send_message(
-                    chat_id,
-                    &format!("No comments found on page {page}/{total_pages}."),
-                    comments_next_keyboard(topic),
-                )
-                .await?;
-            return Ok(());
+    async fn send_comments_topic(
+        &self,
+        chat_id: i64,
+        topic: &TopicDetails,
+        start_comment_index: usize,
+        callback_message: Option<ProgressMessage>,
+    ) -> Result<()> {
+        let comments = comments_text(topic, start_comment_index);
+        let reply_markup = comments_next_keyboard(topic, comments.next_comment_index);
+        if (topic.comments_page > 1 || start_comment_index > 0)
+            && let Some(progress) = callback_message
+        {
+            return self
+                .telegram
+                .edit_message(progress, &comments.text, reply_markup)
+                .await;
         }
-        let mut text = format!("<b>Comments {page}/{total_pages}</b>");
-        for comment in &topic.comments {
-            text.push_str("\n\n");
-            text.push_str(&comment_author_line(comment.author.as_ref()));
-            text.push('\n');
-            text.push_str(&html_escape(&truncate_for_telegram(&comment.text, 500)));
+        if let Some(progress) = callback_message {
+            return self
+                .telegram
+                .send_message_reply_to(chat_id, progress.message_id, &comments.text, reply_markup)
+                .await;
         }
         self.telegram
-            .send_message(chat_id, &text, comments_next_keyboard(topic))
+            .send_message(chat_id, &comments.text, reply_markup)
             .await
     }
 
     fn downloader(&self, topic_id: u64) -> TorrentDownloader {
-        TorrentDownloader::new(
+        // VM seeding mode keeps stable per-topic folders so rqbit can resume
+        // and seed already-downloaded data across requests and restarts.
+        let output_dir = if self.config.seed_torrents {
             self.config
                 .tmp_dir
-                .join(format!("rutracker-{topic_id}-{}", std::process::id())),
-            self.config.peer_limit,
-        )
+                .join("seeds")
+                .join(format!("rutracker-{topic_id}"))
+        } else {
+            self.config
+                .tmp_dir
+                .join(format!("rutracker-{topic_id}-{}", std::process::id()))
+        };
+        let downloader = TorrentDownloader::new(output_dir, self.config.peer_limit);
+        match self.seed_config() {
+            Some(seed_config) => downloader.with_seed_config(seed_config),
+            None => downloader,
+        }
+    }
+
+    fn seed_config(&self) -> Option<SeedConfig> {
+        self.config.seed_torrents.then(|| SeedConfig {
+            root_dir: self.config.tmp_dir.join("seeds"),
+            listen_port: self.config.torrent_listen_port,
+            disk_reserve_bytes: self.config.seed_disk_reserve_mb.saturating_mul(1024 * 1024),
+        })
     }
 
     fn is_allowed_user(&self, user_id: Option<i64>) -> bool {
@@ -1756,7 +1921,6 @@ impl App {
             )
             .await
     }
-
     async fn edit_rutracker_unavailable(
         &self,
         progress: ProgressMessage,
@@ -1945,12 +2109,6 @@ fn format_author(author: &AuthorDetails) -> String {
     if let Some(posts) = author.posts_count {
         text.push_str(&format!(" ({} messages)", posts));
     }
-    if let Some(avatar) = author.avatar_url.as_ref() {
-        text.push_str(&format!(
-            "; avatar: <a href=\"{}\">open</a>",
-            html_escape(avatar)
-        ));
-    }
     text
 }
 
@@ -1959,6 +2117,16 @@ fn format_search_author(result: &SearchResult) -> Option<String> {
         .author
         .as_ref()
         .map(|name| author_name_link(name, result.author_profile_url.as_deref()))
+}
+
+fn first_post_image_url(details: Option<&TopicDetails>) -> Option<&str> {
+    // Search result metadata stays in a normal message because media captions
+    // are limited to 1024 chars. The image is sent separately.
+    details?
+        .first_post_images
+        .first()
+        .map(String::as_str)
+        .filter(|image| !image.trim().is_empty())
 }
 
 fn author_name_link(name: &str, profile_url: Option<&str>) -> String {
@@ -1977,6 +2145,109 @@ fn comment_author_line(author: Option<&AuthorDetails>) -> String {
         Some(author) => format_author(author),
         None => "<b>unknown</b>".to_string(),
     }
+}
+
+struct CommentsText {
+    text: String,
+    next_comment_index: Option<usize>,
+}
+
+/// Formats comments for either a new reply message or a later edit when the
+/// user presses the comments "Next" button.
+fn comments_text(topic: &TopicDetails, start_comment_index: usize) -> CommentsText {
+    let page = topic.comments_page.max(1);
+    let total_pages = topic.comments_total_pages.max(page).max(1);
+    if topic.comments.is_empty() {
+        return CommentsText {
+            text: format!("No comments found on page {page}/{total_pages}."),
+            next_comment_index: None,
+        };
+    }
+    let mut text = format!("<b>Comments {page}/{total_pages}</b>");
+    let start_comment_index = start_comment_index.min(topic.comments.len().saturating_sub(1));
+    for (index, comment) in topic.comments.iter().enumerate().skip(start_comment_index) {
+        let block = comment_block_html(comment);
+        if comments_text_fits(&text, &block) {
+            push_comment_block(&mut text, &block);
+            continue;
+        }
+        if index == start_comment_index {
+            let block = oversized_comment_block_html(&text, comment);
+            push_comment_block(&mut text, &block);
+            return CommentsText {
+                text,
+                next_comment_index: (index + 1 < topic.comments.len()).then_some(index + 1),
+            };
+        }
+        return CommentsText {
+            text,
+            next_comment_index: Some(index),
+        };
+    }
+    CommentsText {
+        text,
+        next_comment_index: None,
+    }
+}
+
+fn comment_block_html(comment: &TopicComment) -> String {
+    format!(
+        "{}\n{}",
+        comment_author_line(comment.author.as_ref()),
+        comment_body_html(comment)
+    )
+}
+
+fn comment_body_html(comment: &TopicComment) -> String {
+    let html = comment.html.trim();
+    if !html.is_empty() {
+        return html.to_string();
+    }
+    html_escape(&comment.text)
+}
+
+fn comments_text_fits(current: &str, block: &str) -> bool {
+    current.chars().count() + 2 + block.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS
+}
+
+fn push_comment_block(text: &mut String, block: &str) {
+    text.push_str("\n\n");
+    text.push_str(block);
+}
+
+fn oversized_comment_block_html(current_text: &str, comment: &TopicComment) -> String {
+    let author = comment_author_line(comment.author.as_ref());
+    let fixed_chars = current_text.chars().count() + 2 + author.chars().count() + 1;
+    let body_budget = TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS.saturating_sub(fixed_chars);
+    format!(
+        "{author}\n{}",
+        html_escape_truncated_to(&comment.text, body_budget)
+    )
+}
+
+fn html_escape_truncated_to(value: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let total_chars = value.chars().count();
+    let mut out = String::new();
+    let mut used = 0;
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        let escaped = html_escape(&ch.to_string());
+        let escaped_len = escaped.chars().count();
+        let reserve_for_ellipsis = usize::from(index + 1 < total_chars);
+        if used + escaped_len + reserve_for_ellipsis > limit {
+            truncated = true;
+            break;
+        }
+        out.push_str(&escaped);
+        used += escaped_len;
+    }
+    if truncated && used < limit {
+        out.push('…');
+    }
+    out
 }
 
 fn files_from_topic_text(topic: &TopicDetails, max_file_mb: u64) -> String {
@@ -2045,12 +2316,43 @@ fn selectable_files(metadata: &TorrentMetadata, max_file_mb: u64) -> Vec<&Torren
         .collect()
 }
 
-fn comments_next_keyboard(topic: &TopicDetails) -> Option<Value> {
+fn selection_file_button_label(file: &TorrentFile, selected: bool) -> String {
+    let file_name = file
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| file.path.to_str().unwrap_or("file"));
+    let label = format!(
+        "{} ({})",
+        truncate_for_telegram(file_name, SELECTION_FILE_BUTTON_LABEL_CHARS),
+        format_bytes(file.size_bytes)
+    );
+    if selected {
+        format!("✅ {label}")
+    } else {
+        label
+    }
+}
+
+fn comments_next_keyboard(
+    topic: &TopicDetails,
+    next_comment_index: Option<usize>,
+) -> Option<Value> {
+    if let Some(next_comment_index) = next_comment_index {
+        return Some(inline_keyboard(vec![vec![callback_button(
+            "Next comments",
+            &format!(
+                "comments:{}:{}:{next_comment_index}",
+                topic.topic_id, topic.comments_page
+            ),
+        )]]));
+    }
     let next_page = topic.comments_page.saturating_add(1);
     (next_page <= topic.comments_total_pages).then(|| {
         inline_keyboard(vec![vec![callback_button(
             &format!("Next {}/{}", next_page, topic.comments_total_pages),
-            &format!("comments:{}:{next_page}", topic.topic_id),
+            &format!("comments:{}:{next_page}:0", topic.topic_id),
         )]])
     })
 }
@@ -2074,12 +2376,16 @@ fn rutracker_unavailable_inline_result() -> Value {
     })
 }
 
-fn parse_comments_callback(value: &str) -> Option<(u64, u32)> {
+fn parse_comments_callback(value: &str) -> Option<(u64, u32, usize)> {
     let rest = value.strip_prefix("comments:")?;
-    let mut parts = rest.splitn(2, ':');
+    let mut parts = rest.split(':');
     let topic_id = parts.next().and_then(parse_u64)?;
-    let page = parts.next()?.parse::<u32>().ok()?;
-    Some((topic_id, page.max(1)))
+    let page = parts.next()?.parse::<u32>().ok()?.max(1);
+    let start_comment_index = parts
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    Some((topic_id, page, start_comment_index))
 }
 
 fn parse_selection_page_callback(value: &str) -> Option<(String, usize)> {
@@ -2098,9 +2404,8 @@ fn parse_selection_toggle_callback(value: &str) -> Option<(String, usize)> {
     Some((key, index))
 }
 
-fn category_search_callback(forum_id: u64, query: &str) -> String {
-    let key = store_query_cache(query);
-    format!("cs:{forum_id}:{key}")
+fn category_latest_callback(forum_id: u64) -> String {
+    format!("cat:{forum_id}")
 }
 
 fn store_download_selection(selection: DownloadSelection) -> String {
@@ -2146,34 +2451,6 @@ fn mark_update_seen(update_id: i64) -> bool {
     true
 }
 
-fn store_query_cache(query: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(query.as_bytes());
-    hasher.update(now_seconds().to_be_bytes());
-    let digest = hasher.finalize();
-    let key = URL_SAFE_NO_PAD.encode(&digest[..9]);
-    let cache = QUERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("query cache poisoned");
-    let now = now_seconds();
-    guard.retain(|_, entry| now.saturating_sub(entry.created_at) < 3600);
-    guard.insert(
-        key.clone(),
-        QueryCacheEntry {
-            query: query.to_string(),
-            created_at: now,
-        },
-    );
-    key
-}
-
-fn load_query_cache(key: &str) -> Option<String> {
-    let cache = QUERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().ok()?;
-    let now = now_seconds();
-    guard.retain(|_, entry| now.saturating_sub(entry.created_at) < 3600);
-    guard.get(key).map(|entry| entry.query.clone())
-}
-
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2185,6 +2462,81 @@ fn is_help_command(text: &str) -> bool {
     matches!(
         telegram_command_name(text).as_deref(),
         Some("start" | "help")
+    )
+}
+
+fn is_stat_command(text: &str) -> bool {
+    matches!(
+        telegram_command_name(text).as_deref(),
+        Some("stat" | "stats")
+    )
+}
+
+fn help_text(max_file_mb: u64) -> String {
+    let upload_text = if max_file_mb <= crate::TELEGRAM_MAX_FILE_MB_DEFAULT {
+        format!(
+            "Downloads are limited to files under {} because Telegram Bot API \
+             <a href=\"https://core.telegram.org/bots/api#senddocument\">sendDocument</a> has that upload limit.",
+            upload_limit_label(crate::TELEGRAM_MAX_FILE_MB_DEFAULT)
+        )
+    } else {
+        format!(
+            "Downloads are limited to files under {} by this deployment. Public Telegram Bot API \
+             <a href=\"https://core.telegram.org/bots/api#senddocument\">sendDocument</a> uploads are limited to {}; \
+             tdlib's local telegram-bot-api server can send larger files: https://github.com/tdlib/telegram-bot-api",
+            upload_limit_label(max_file_mb),
+            upload_limit_label(crate::TELEGRAM_MAX_FILE_MB_DEFAULT)
+        )
+    };
+
+    format!(
+        concat!(
+            "This is an unofficial bot and is not affiliated with RuTracker.\n\n",
+            "Send a RuTracker search string. I search rutracker.org titles and return matching topics.\n\n",
+            "Use <code>c text</code> to search categories. Category buttons return the 10 most recent topics from that category.\n\n",
+            "Use <code>/stat</code> to show torrents currently seeding from the VM, including uploaded bytes and ratio.\n\n",
+            "{}\n\n",
+            "Torrent downloads use librqbit, the rqbit torrent client library: ",
+            "https://github.com/ikatson/rqbit\n\n",
+            "AWS Lambda can run one invocation for at most 15 minutes: ",
+            "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
+            "If RuTracker is unavailable, I return the official news channel link: @rutracker_news. ",
+            "RuTracker runs on low-cost community infrastructure; please consider donating to them.\n\n",
+            "Please seed legal torrents when you can; it helps the ecosystem. ",
+            "Respect creators, and consider supporting your favorite artists and authors with money or by buying from them. ",
+            "Torrents are also culture preservation: many works are public domain, Creative Commons, abandoned, or otherwise unavailable to buy legally.\n\n",
+            "If you know an indie artist, consider asking whether they want to release some work under Creative Commons and publish it legally on RuTracker, so more people can discover them.\n\n",
+            "Source code: https://github.com/vitaly-zdanevich/bot_telegram_rutracker"
+        ),
+        upload_text
+    )
+}
+
+fn download_prompt_text(max_file_mb: u64) -> String {
+    format!(
+        "<b>Download</b>\nChoose all files under {}, or select specific files from torrent metadata.",
+        upload_limit_label(max_file_mb)
+    )
+}
+
+fn upload_limit_label(max_file_mb: u64) -> String {
+    format!("{max_file_mb} MB")
+}
+
+fn download_timeout_message(config: &Config, outcome: &DownloadOutcome) -> String {
+    if config.download_countdown_label == "AWS Lambda lifetime" {
+        return format!(
+            "Downloaded and sent {} of {} files - sorry, AWS Lambda lifetime is only 15 minutes.",
+            outcome.files.len(),
+            outcome.total_files
+        );
+    }
+
+    format!(
+        "Downloaded and sent {} of {} files before {} expired.",
+        outcome.files.len(),
+        outcome.total_files,
+        config.download_countdown_label.to_lowercase()
     )
 }
 
@@ -2218,11 +2570,81 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn seed_stats_text(stats: &[SeedTorrentStats]) -> String {
+    if stats.is_empty() {
+        return "No torrents are currently seeding from this VM.".to_string();
+    }
+    let total_uploaded = stats
+        .iter()
+        .map(|torrent| torrent.uploaded_bytes)
+        .sum::<u64>();
+    let total_size = stats.iter().map(|torrent| torrent.total_bytes).sum::<u64>();
+    let mut text = format!(
+        "<b>Seeding from VM</b>\nTorrents: {}\nUploaded: {}; ratio: {}",
+        stats.len(),
+        format_bytes(total_uploaded),
+        format_ratio(total_uploaded, total_size)
+    );
+
+    for (index, torrent) in stats.iter().enumerate() {
+        let line = seed_stat_line(index + 1, torrent);
+        if text.chars().count() + line.chars().count() > TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
+            let omitted = stats.len() - index;
+            text.push_str(&format!("\n... {omitted} more torrents"));
+            break;
+        }
+        text.push_str(&line);
+    }
+    text
+}
+
+fn seed_stat_line(index: usize, torrent: &SeedTorrentStats) -> String {
+    format!(
+        "\n\n{}. <b>{}</b>\nState: {}; progress: {} / {}\nUploaded: {}; ratio: {}; up: {}",
+        index,
+        html_escape(&truncate_for_telegram(&torrent.name, 120)),
+        html_escape(&torrent.state),
+        format_bytes(torrent.progress_bytes),
+        format_bytes(torrent.total_bytes),
+        format_bytes(torrent.uploaded_bytes),
+        format_ratio(torrent.uploaded_bytes, torrent.total_bytes),
+        html_escape(&torrent.upload_speed)
+    )
+}
+
+fn format_ratio(uploaded_bytes: u64, total_bytes: u64) -> String {
+    if total_bytes == 0 {
+        return "N/A".to_string();
+    }
+    format!("{:.2}", uploaded_bytes as f64 / total_bytes as f64)
+}
+
 fn topic_title_link(title: &str, topic_url: &str) -> String {
     format!(
         "<a href=\"{}\">{}</a>",
         html_escape(topic_url),
         html_escape(title)
+    )
+}
+
+fn downloaded_file_caption(
+    title: &str,
+    topic_url: &str,
+    size_bytes: u64,
+    completed: usize,
+    total: usize,
+) -> String {
+    let suffix = format!(" ({}) - file {completed}/{total}", format_bytes(size_bytes));
+    let escaped_url = html_escape(topic_url);
+    let fixed_chars = "<a href=\"".len()
+        + escaped_url.chars().count()
+        + "\">".len()
+        + "</a>".len()
+        + suffix.chars().count();
+    let title_budget = TELEGRAM_CAPTION_LIMIT_CHARS.saturating_sub(fixed_chars);
+    format!(
+        "<a href=\"{escaped_url}\">{}</a>{suffix}",
+        html_escape_truncated_to(title, title_budget)
     )
 }
 
@@ -2240,16 +2662,29 @@ fn message_has_files_section(text: Option<&str>) -> bool {
     })
 }
 
-fn all_files_button_label(topic: &TopicDetails, max_file_mb: u64) -> &'static str {
+fn resolving_files_text(current_text: Option<&str>) -> String {
+    const STATUS: &str = "Resolving magnet metadata for file list...";
+    let Some(current_text) = current_text.map(str::trim).filter(|text| !text.is_empty()) else {
+        return STATUS.to_string();
+    };
+    let with_status = format!("{current_text}\n\n{STATUS}");
+    if with_status.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
+        with_status
+    } else {
+        STATUS.to_string()
+    }
+}
+
+fn all_files_button_label(topic: &TopicDetails, max_file_mb: u64) -> String {
     let safe_bytes = telegram_safe_file_bytes(max_file_mb);
     let has_oversized_file = topic
         .first_post_files
         .iter()
         .any(|file| file.size_bytes.is_some_and(|size| size > safe_bytes));
     if has_oversized_file {
-        "All under 50 MB"
+        format!("All under {}", upload_limit_label(max_file_mb))
     } else {
-        "All"
+        "All".to_string()
     }
 }
 
@@ -2338,15 +2773,64 @@ fn remove_callback_button(reply_markup: Option<Value>, callback_data: &str) -> O
 fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
     let mut lines = Vec::new();
     if let Some(release_type) = topic.release_type.as_ref() {
-        lines.push(format!("Тип: {}", html_escape(release_type)));
+        if release_type.trim().to_lowercase() == "авторская" {
+            lines.push("<b>Uploaded by author</b>".to_string());
+        } else {
+            lines.push(format!("Тип: {}", html_escape(release_type)));
+        }
     }
     if let Some(publication_date) = topic.publication_date.as_ref() {
-        lines.push(format!(
-            "Дата публикации: {}",
-            html_escape(publication_date)
-        ));
+        lines.push(format!("Published: {}", html_escape(publication_date)));
     }
     lines.join("\n")
+}
+
+fn format_description_html(description: &str) -> String {
+    let lines = description.lines().collect::<Vec<_>>();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if let Some(title) = spoiler_title(lines[index]) {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                if out.ends_with('\n') {
+                    out.push('\n');
+                } else {
+                    out.push_str("\n\n");
+                }
+            }
+            out.push_str("<blockquote><b>");
+            out.push_str(&html_escape(title));
+            out.push_str("</b>");
+            index += 1;
+            while index < lines.len() {
+                if lines[index].trim().is_empty() || spoiler_title(lines[index]).is_some() {
+                    break;
+                }
+                out.push('\n');
+                out.push_str(&html_escape(lines[index]));
+                index += 1;
+            }
+            out.push_str("</blockquote>");
+            while index < lines.len() && lines[index].trim().is_empty() {
+                index += 1;
+            }
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&html_escape(lines[index]));
+        index += 1;
+    }
+    out
+}
+
+fn spoiler_title(line: &str) -> Option<&str> {
+    let line = line.trim();
+    line.strip_prefix("== ")
+        .and_then(|line| line.strip_suffix(" =="))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
 }
 
 #[cfg(test)]
@@ -2355,21 +2839,30 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::config::Config;
-    use crate::rutracker::{CategoryRef, RutrackerClient, TopicFile};
-    use crate::telegram::{TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, Telegram};
+    use crate::downloader::SeedTorrentStats;
+    use crate::rutracker::{AuthorDetails, CategoryRef, RutrackerClient, TopicComment, TopicFile};
+    use crate::telegram::{
+        TELEGRAM_CAPTION_LIMIT_CHARS, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
+    };
+    use crate::torrent::TorrentFile;
 
     use super::{
-        App, HELP_TEXT, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails,
-        all_files_button_label, author_name_link, callback_button, download_prompt_reply_markup,
-        files_from_topic_text, format_bytes, format_topic_metadata_lines, inline_keyboard,
-        mark_update_seen, message_has_files_section, message_has_section, remove_callback_button,
-        telegram_command_name, topic_title_link,
+        App, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, all_files_button_label,
+        author_name_link, callback_button, category_latest_callback, comments_next_keyboard,
+        comments_text, download_prompt_reply_markup, downloaded_file_caption,
+        files_from_topic_text, first_post_image_url, format_author, format_bytes,
+        format_description_html, format_topic_metadata_lines, help_text, inline_keyboard,
+        mark_update_seen, message_has_files_section, message_has_section, now_seconds,
+        parse_comments_callback, remove_callback_button, resolving_files_text, seed_stats_text,
+        selection_file_button_label, telegram_command_name, topic_title_link,
+        verify_vm_worker_signature, vm_worker_signature,
     };
 
     fn test_app() -> App {
         let base_urls = vec!["https://rutracker.org/forum".to_string()];
         let config = Config {
             telegram_bot_token: "telegram-token".to_string(),
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
             telegram_webhook_secret: "webhook-secret".to_string(),
             allowed_telegram_user_ids: HashSet::new(),
             rutracker_base_urls: base_urls.clone(),
@@ -2383,12 +2876,20 @@ mod tests {
             max_file_mb: 50,
             lambda_timeout_seconds: 900,
             download_margin_seconds: 20,
+            download_countdown_label: "AWS Lambda lifetime".to_string(),
+            download_status_interval_seconds: 60,
             peer_limit: 120,
+            seed_torrents: false,
+            torrent_listen_port: 49152,
+            seed_disk_reserve_mb: 0,
         };
         let rutracker = RutrackerClient::new(&base_urls, None, None, 1, 1).unwrap();
         App {
             config,
-            telegram: Telegram::new("telegram-token".to_string()),
+            telegram: Telegram::new(
+                "telegram-token".to_string(),
+                "https://api.telegram.org".to_string(),
+            ),
             rutracker,
         }
     }
@@ -2405,7 +2906,48 @@ mod tests {
             telegram_command_name("/help@bot test").as_deref(),
             Some("help")
         );
+        assert_eq!(
+            telegram_command_name("/stat@bot test").as_deref(),
+            Some("stat")
+        );
         assert_eq!(telegram_command_name("hello"), None);
+    }
+
+    #[test]
+    fn formats_seed_stats_text() {
+        let text = seed_stats_text(&[SeedTorrentStats {
+            id: 7,
+            name: "Album & Singles".to_string(),
+            state: "live".to_string(),
+            progress_bytes: 50 * 1024 * 1024,
+            total_bytes: 50 * 1024 * 1024,
+            uploaded_bytes: 75 * 1024 * 1024,
+            upload_speed: "1.25 MiB/s".to_string(),
+        }]);
+
+        assert!(text.contains("<b>Seeding from VM</b>"));
+        assert!(text.contains("<b>Album &amp; Singles</b>"));
+        assert!(text.contains("Uploaded: 75.0 MB; ratio: 1.50; up: 1.25 MiB/s"));
+    }
+
+    #[test]
+    fn seed_stats_text_stays_within_telegram_limit() {
+        let stats = (0..200)
+            .map(|index| SeedTorrentStats {
+                id: index,
+                name: format!("Torrent {index} {}", "long name ".repeat(20)),
+                state: "live".to_string(),
+                progress_bytes: 1024 * 1024,
+                total_bytes: 1024 * 1024,
+                uploaded_bytes: 0,
+                upload_speed: "0.00 MiB/s".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let text = seed_stats_text(&stats);
+
+        assert!(text.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(text.contains("more torrents"));
     }
 
     #[test]
@@ -2417,6 +2959,24 @@ mod tests {
             ),
             "<a href=\"https://rutracker.org/forum/viewtopic.php?t=42&amp;x=1\">A &amp; B</a>"
         );
+    }
+
+    #[test]
+    fn formats_downloaded_file_caption_as_source_link() {
+        let caption = downloaded_file_caption(
+            "Album & Singles",
+            "https://rutracker.org/forum/viewtopic.php?t=42",
+            12 * 1024 * 1024,
+            2,
+            5,
+        );
+
+        assert!(caption.starts_with(
+            "<a href=\"https://rutracker.org/forum/viewtopic.php?t=42\">Album &amp; Singles</a>"
+        ));
+        assert!(caption.contains("12.0 MB"));
+        assert!(caption.contains("file 2/5"));
+        assert!(caption.chars().count() <= TELEGRAM_CAPTION_LIMIT_CHARS);
     }
 
     #[test]
@@ -2453,6 +3013,21 @@ mod tests {
         assert!(!message_has_files_section(Some(
             "Title\n\nDownload\nSelect files"
         )));
+    }
+
+    #[test]
+    fn resolving_files_text_preserves_current_message_when_it_fits() {
+        let text = resolving_files_text(Some("Title\nCategory: Music"));
+
+        assert!(text.starts_with("Title\nCategory: Music"));
+        assert!(text.contains("Resolving magnet metadata for file list..."));
+    }
+
+    #[test]
+    fn resolving_files_text_falls_back_when_current_message_is_too_large() {
+        let text = resolving_files_text(Some(&"x".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS)));
+
+        assert_eq!(text, "Resolving magnet metadata for file list...");
     }
 
     #[test]
@@ -2524,6 +3099,7 @@ mod tests {
         let markup = inline_keyboard(vec![
             vec![
                 callback_button("Description", "desc:42"),
+                callback_button("Comments", "comments:42:1"),
                 callback_button("Files", "files:42"),
             ],
             vec![callback_button("Download", "dl:42")],
@@ -2583,6 +3159,47 @@ mod tests {
             all_files_button_label(&oversized_file_topic, 50),
             "All under 50 MB"
         );
+        assert_eq!(all_files_button_label(&oversized_file_topic, 2000), "All");
+    }
+
+    #[test]
+    fn selection_file_buttons_use_names_and_checkmark() {
+        let file = TorrentFile {
+            index: 3,
+            path: PathBuf::from("Album/track.flac"),
+            size_bytes: 30 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            selection_file_button_label(&file, false),
+            "track.flac (30.0 MB)"
+        );
+        assert_eq!(
+            selection_file_button_label(&file, true),
+            "✅ track.flac (30.0 MB)"
+        );
+    }
+
+    #[test]
+    fn category_buttons_open_recent_topics() {
+        assert_eq!(category_latest_callback(441), "cat:441");
+    }
+
+    #[test]
+    fn first_post_image_does_not_depend_on_caption_length() {
+        let topic = TopicDetails {
+            first_post_images: vec![
+                "https://rutracker.org/image-one.jpg".to_string(),
+                "https://rutracker.org/image-two.jpg".to_string(),
+            ],
+            ..TopicDetails::default()
+        };
+
+        assert_eq!(
+            first_post_image_url(Some(&topic)),
+            Some("https://rutracker.org/image-one.jpg")
+        );
+        assert_eq!(first_post_image_url(None), None);
     }
 
     #[test]
@@ -2590,6 +3207,7 @@ mod tests {
         let markup = inline_keyboard(vec![
             vec![
                 callback_button("Description", "desc:42"),
+                callback_button("Comments", "comments:42:1"),
                 callback_button("Files", "files:42"),
             ],
             vec![callback_button("Download", "dl:42")],
@@ -2605,9 +3223,15 @@ mod tests {
             rows[0][0]
                 .get("callback_data")
                 .and_then(serde_json::Value::as_str),
+            Some("comments:42:1")
+        );
+        assert_eq!(rows[0].as_array().unwrap().len(), 2);
+        assert_eq!(
+            rows[0][1]
+                .get("callback_data")
+                .and_then(serde_json::Value::as_str),
             Some("files:42")
         );
-        assert_eq!(rows[0].as_array().unwrap().len(), 1);
         assert_eq!(
             rows[1][0]
                 .get("callback_data")
@@ -2633,17 +3257,214 @@ mod tests {
     fn formats_topic_metadata_lines() {
         let topic = TopicDetails {
             release_type: Some("авторская".to_string()),
-            publication_date: Some("07-Jun-26 12:34".to_string()),
+            publication_date: Some("2026-june-07".to_string()),
             ..TopicDetails::default()
         };
         assert_eq!(
             format_topic_metadata_lines(&topic),
-            "Тип: авторская\nДата публикации: 07-Jun-26 12:34"
+            "<b>Uploaded by author</b>\nPublished: 2026-june-07"
+        );
+    }
+
+    #[test]
+    fn places_user_before_topic_metadata() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            category_path: vec![CategoryRef {
+                id: 23,
+                name: "Music".to_string(),
+            }],
+            author: Some(AuthorDetails {
+                name: "artist".to_string(),
+                profile_url: Some(
+                    "https://rutracker.org/forum/profile.php?mode=viewprofile&u=12".to_string(),
+                ),
+                posts_count: Some(25),
+                avatar_url: None,
+            }),
+            release_type: Some("авторская".to_string()),
+            publication_date: Some("2026-june-07".to_string()),
+            ..TopicDetails::default()
+        };
+
+        let text = app.topic_message_header(&topic).unwrap();
+
+        assert!(text.contains("Category:"));
+        assert!(text.contains("User:"));
+        assert!(text.contains("<b>Uploaded by author</b>"));
+        assert!(text.find("Category:").unwrap() < text.find("User:").unwrap());
+        assert!(text.find("User:").unwrap() < text.find("<b>Uploaded by author</b>").unwrap());
+    }
+
+    #[test]
+    fn formats_comments_text() {
+        let topic = TopicDetails {
+            comments_page: 2,
+            comments_total_pages: 6,
+            comments: vec![TopicComment {
+                author: Some(AuthorDetails {
+                    name: "listener".to_string(),
+                    profile_url: Some(
+                        "https://rutracker.org/forum/profile.php?mode=viewprofile&u=77".to_string(),
+                    ),
+                    posts_count: Some(12),
+                    avatar_url: None,
+                }),
+                text: "Nice & legal release".to_string(),
+                html: "Nice <a href=\"https://example.invalid/release\">legal release</a>"
+                    .to_string(),
+            }],
+            ..TopicDetails::default()
+        };
+
+        let comments = comments_text(&topic, 0);
+
+        assert!(comments.text.starts_with("<b>Comments 2/6</b>"));
+        assert!(comments.text.contains("listener"));
+        assert!(comments.text.contains("(12 messages)"));
+        assert!(
+            comments
+                .text
+                .contains("Nice <a href=\"https://example.invalid/release\">legal release</a>")
+        );
+        assert_eq!(comments.next_comment_index, None);
+    }
+
+    #[test]
+    fn keeps_long_comment_html_until_message_limit() {
+        let long_link_text = "legal ".repeat(250);
+        let topic = TopicDetails {
+            comments_page: 1,
+            comments_total_pages: 1,
+            comments: vec![TopicComment {
+                author: None,
+                text: long_link_text.clone(),
+                html: format!("<a href=\"https://example.invalid/release\">{long_link_text}</a>"),
+            }],
+            ..TopicDetails::default()
+        };
+
+        let comments = comments_text(&topic, 0);
+
+        assert!(
+            comments
+                .text
+                .contains("<a href=\"https://example.invalid/release\">")
+        );
+        assert!(comments.text.contains(&long_link_text));
+        assert_eq!(comments.next_comment_index, None);
+    }
+
+    #[test]
+    fn truncates_only_single_comment_that_exceeds_message_limit() {
+        let huge = "comment & ".repeat(800);
+        let topic = TopicDetails {
+            comments_page: 1,
+            comments_total_pages: 1,
+            comments: vec![TopicComment {
+                author: None,
+                text: huge,
+                html: "x".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS + 100),
+            }],
+            ..TopicDetails::default()
+        };
+
+        let comments = comments_text(&topic, 0);
+
+        assert!(comments.text.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(comments.text.contains("comment &amp;"));
+        assert!(comments.text.ends_with('…'));
+        assert_eq!(comments.next_comment_index, None);
+    }
+
+    #[test]
+    fn paginates_comments_when_message_limit_would_be_exceeded() {
+        let topic = TopicDetails {
+            topic_id: 42,
+            comments_page: 1,
+            comments_total_pages: 3,
+            comments: vec![
+                TopicComment {
+                    author: None,
+                    text: "a".repeat(1800),
+                    html: "a".repeat(1800),
+                },
+                TopicComment {
+                    author: None,
+                    text: "b".repeat(1800),
+                    html: "b".repeat(1800),
+                },
+                TopicComment {
+                    author: None,
+                    text: "c".repeat(1800),
+                    html: "c".repeat(1800),
+                },
+            ],
+            ..TopicDetails::default()
+        };
+
+        let first = comments_text(&topic, 0);
+        let second = comments_text(&topic, first.next_comment_index.unwrap());
+        let same_page_markup = comments_next_keyboard(&topic, first.next_comment_index).unwrap();
+        let next_page_markup = comments_next_keyboard(&topic, second.next_comment_index).unwrap();
+
+        assert_eq!(first.next_comment_index, Some(2));
+        assert!(first.text.contains(&"a".repeat(1800)));
+        assert!(first.text.contains(&"b".repeat(1800)));
+        assert!(!first.text.contains(&"c".repeat(1800)));
+        assert_eq!(second.next_comment_index, None);
+        assert!(second.text.contains(&"c".repeat(1800)));
+        assert!(
+            serde_json::to_string(&same_page_markup)
+                .unwrap()
+                .contains("comments:42:1:2")
+        );
+        assert!(
+            serde_json::to_string(&next_page_markup)
+                .unwrap()
+                .contains("comments:42:2:0")
+        );
+    }
+
+    #[test]
+    fn parses_comment_callbacks_with_optional_offset() {
+        assert_eq!(parse_comments_callback("comments:42:2"), Some((42, 2, 0)));
+        assert_eq!(parse_comments_callback("comments:42:2:5"), Some((42, 2, 5)));
+    }
+
+    #[test]
+    fn omits_author_avatar_from_metadata() {
+        let author = AuthorDetails {
+            name: "artist".to_string(),
+            profile_url: Some(
+                "https://rutracker.org/forum/profile.php?mode=viewprofile&u=12".to_string(),
+            ),
+            posts_count: Some(184),
+            avatar_url: Some("https://rutracker.org/avatar.jpg".to_string()),
+        };
+
+        let text = format_author(&author);
+
+        assert!(text.contains("(184 messages)"));
+        assert!(!text.contains("avatar"));
+        assert!(!text.contains("avatar: open"));
+    }
+
+    #[test]
+    fn formats_spoilers_as_blockquotes() {
+        let description = "Track list\n\n== Об исполнителе (группе) ==\nДепрессивно & честно.\n\nДоп. информация: source";
+
+        assert_eq!(
+            format_description_html(description),
+            "Track list\n\n<blockquote><b>Об исполнителе (группе)</b>\nДепрессивно &amp; честно.</blockquote>\nДоп. информация: source"
         );
     }
 
     #[test]
     fn rutracker_unavailable_message_points_to_news_channel() {
+        assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("bot backend"));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains("@rutracker_news"));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains(RUTRACKER_NEWS_URL));
         assert!(RUTRACKER_UNAVAILABLE_TEXT.contains(".\nRuTracker runs"));
@@ -2651,25 +3472,46 @@ mod tests {
     }
 
     #[test]
+    fn signs_and_verifies_vm_worker_payloads() {
+        let payload = br#"{"update_id":1}"#;
+        let timestamp = now_seconds().to_string();
+        let signature = vm_worker_signature("secret", &timestamp, payload).unwrap();
+
+        verify_vm_worker_signature("secret", &timestamp, &signature, payload).unwrap();
+        assert!(verify_vm_worker_signature("other", &timestamp, &signature, payload).is_err());
+        assert!(verify_vm_worker_signature("secret", &timestamp, "sha256=bad", payload).is_err());
+    }
+
+    #[test]
     fn help_mentions_limits_unofficial_status_and_donations() {
-        assert!(HELP_TEXT.contains("https://github.com/ikatson/rqbit"));
-        assert!(HELP_TEXT.contains(
+        let help = help_text(50);
+        assert!(help.contains("https://github.com/ikatson/rqbit"));
+        assert!(help.contains("<code>/stat</code>"));
+        assert!(help.contains("Category buttons return the 10 most recent topics"));
+        assert!(help.contains(
             "<a href=\"https://core.telegram.org/bots/api#senddocument\">sendDocument</a>"
         ));
         assert!(
-            HELP_TEXT.contains(
+            help.contains(
                 "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html"
             )
         );
-        assert!(HELP_TEXT.contains("at most 15 minutes"));
-        assert!(!HELP_TEXT.contains("900 seconds"));
-        assert!(HELP_TEXT.contains("unofficial bot"));
-        assert!(HELP_TEXT.contains("donating"));
-        assert!(HELP_TEXT.contains("seed legal torrents"));
-        assert!(HELP_TEXT.contains("favorite artists and authors"));
-        assert!(HELP_TEXT.contains("culture preservation"));
-        assert!(HELP_TEXT.contains("Creative Commons"));
-        assert!(HELP_TEXT.contains("indie artist"));
-        assert!(HELP_TEXT.contains("publish it legally on RuTracker"));
+        assert!(help.contains("at most 15 minutes"));
+        assert!(!help.contains("900 seconds"));
+        assert!(help.contains("unofficial bot"));
+        assert!(help.contains("donating"));
+        assert!(help.contains("seed legal torrents"));
+        assert!(help.contains("favorite artists and authors"));
+        assert!(help.contains("culture preservation"));
+        assert!(help.contains("Creative Commons"));
+        assert!(help.contains("indie artist"));
+        assert!(help.contains("publish it legally on RuTracker"));
+    }
+
+    #[test]
+    fn help_mentions_local_bot_api_for_larger_uploads() {
+        let help = help_text(2000);
+        assert!(help.contains("2000 MB"));
+        assert!(help.contains("https://github.com/tdlib/telegram-bot-api"));
     }
 }

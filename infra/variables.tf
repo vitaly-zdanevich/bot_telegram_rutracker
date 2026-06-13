@@ -45,10 +45,35 @@ variable "telegram_webhook_secret" {
   sensitive   = true
 }
 
+variable "telegram_api_base_url" {
+  description = "Optional Telegram Bot API base URL. Leave empty for https://api.telegram.org; use a local tdlib telegram-bot-api server URL for larger uploads."
+  type        = string
+  default     = ""
+}
+
 variable "allowed_telegram_user_ids" {
   description = "Comma-separated Telegram user IDs. Empty string makes the bot public."
   type        = string
   default     = ""
+}
+
+variable "vm_worker_url" {
+  description = "Optional signed VM worker endpoint. When set, the webhook Lambda tries this before falling back to the Lambda worker."
+  type        = string
+  default     = ""
+}
+
+variable "vm_worker_secret" {
+  description = "Shared HMAC secret for the optional VM worker endpoint."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "vm_worker_timeout_ms" {
+  description = "Timeout for webhook Lambda calls to vm_worker_url before falling back to the Lambda worker."
+  type        = number
+  default     = 1500
 }
 
 variable "rutracker_base_urls" {

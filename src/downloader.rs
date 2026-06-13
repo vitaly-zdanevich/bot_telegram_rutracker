@@ -1,16 +1,20 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse, Session,
-    SessionOptions, TorrentStats,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
+    ListenerMode, ListenerOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
 };
+use nix::sys::statvfs::statvfs;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::telegram_safe_file_bytes;
 use crate::torrent::{TorrentFile, TorrentMetadata, build_magnet};
@@ -29,6 +33,17 @@ pub struct DownloadedFile {
     pub size_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeedTorrentStats {
+    pub id: usize,
+    pub name: String,
+    pub state: String,
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub upload_speed: String,
+}
+
 pub struct DownloadRequest<'a> {
     pub magnet: &'a str,
     pub metadata: &'a TorrentMetadata,
@@ -38,19 +53,92 @@ pub struct DownloadRequest<'a> {
     pub final_window_seconds: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct SeedConfig {
+    /// Root directory containing persistent rqbit state and per-topic data dirs.
+    pub root_dir: PathBuf,
+    /// TCP/uTP port announced for incoming peers when the VM seeds torrents.
+    pub listen_port: u16,
+    /// Extra free space to keep after fitting the selected download bytes.
+    pub disk_reserve_bytes: u64,
+}
+
 pub struct TorrentDownloader {
     output_dir: PathBuf,
     peer_limit: usize,
+    seed_config: Option<SeedConfig>,
 }
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SeedSessionKey {
+    root_dir: PathBuf,
+    listen_port: u16,
+    peer_limit: usize,
+}
+
+static SEED_SESSIONS: OnceLock<Mutex<HashMap<SeedSessionKey, Arc<Session>>>> = OnceLock::new();
+static SEED_DOWNLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 impl TorrentDownloader {
     pub fn new(output_dir: PathBuf, peer_limit: usize) -> Self {
         Self {
             output_dir,
             peer_limit,
+            seed_config: None,
         }
     }
 
+    pub fn with_seed_config(mut self, seed_config: SeedConfig) -> Self {
+        self.seed_config = Some(seed_config);
+        self
+    }
+
+    /// Starts the shared persistent seed session without adding a new torrent.
+    ///
+    /// VM workers call this on startup so the listener opens immediately and
+    /// rqbit restores previously persisted torrents before the next Telegram
+    /// update arrives.
+    pub async fn initialize_seed_session(
+        seed_config: SeedConfig,
+        peer_limit: usize,
+    ) -> Result<Arc<Session>> {
+        seed_session(&seed_config, peer_limit).await
+    }
+
+    /// Returns a snapshot of torrents currently managed by the persistent VM
+    /// seed session.
+    pub async fn seed_stats(
+        seed_config: SeedConfig,
+        peer_limit: usize,
+    ) -> Result<Vec<SeedTorrentStats>> {
+        let session = seed_session(&seed_config, peer_limit).await?;
+        let mut stats = session.with_torrents(|torrents| {
+            torrents
+                .map(|(id, handle)| {
+                    let torrent_stats = handle.stats();
+                    SeedTorrentStats {
+                        id,
+                        name: handle
+                            .name()
+                            .unwrap_or_else(|| handle.info_hash().as_string()),
+                        state: torrent_stats.state.to_string(),
+                        progress_bytes: torrent_stats.progress_bytes,
+                        total_bytes: torrent_stats.total_bytes,
+                        uploaded_bytes: torrent_stats.uploaded_bytes,
+                        upload_speed: torrent_stats
+                            .live
+                            .as_ref()
+                            .map(|live| live.upload_speed.to_string())
+                            .unwrap_or_else(|| "0.00 MiB/s".to_string()),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        stats.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(stats)
+    }
+
+    /// Resolves torrent metadata from a magnet link without downloading files.
     pub async fn metadata_from_magnet(
         &self,
         magnet: &str,
@@ -87,6 +175,13 @@ impl TorrentDownloader {
         F: FnMut(DownloadedFile, usize, usize) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        // Seeding mode mutates shared rqbit state and may evict old torrents,
+        // so downloads are serialized to avoid deleting files still being sent.
+        let _seed_guard = if self.seed_config.is_some() {
+            Some(seed_download_lock().lock().await)
+        } else {
+            None
+        };
         let safe_bytes = telegram_safe_file_bytes(request.max_file_mb);
         let selected_files =
             selected_download_files(request.metadata, request.selected_indexes, safe_bytes)?;
@@ -95,6 +190,7 @@ impl TorrentDownloader {
             .map(|file| file.index)
             .collect::<Vec<_>>();
 
+        self.prepare_output_dir(&selected_files).await?;
         tokio::fs::create_dir_all(&self.output_dir)
             .await
             .context("failed to create torrent output directory")?;
@@ -168,15 +264,57 @@ impl TorrentDownloader {
         })
     }
 
-    async fn session(&self) -> Result<std::sync::Arc<Session>> {
+    async fn prepare_output_dir(&self, selected_files: &[TorrentFile]) -> Result<()> {
+        let Some(seed_config) = self.seed_config.as_ref() else {
+            cleanup_stale_download_dirs(&self.output_dir).await;
+            return Ok(());
+        };
+        tokio::fs::create_dir_all(&seed_config.root_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create seed cache directory {}",
+                    seed_config.root_dir.display()
+                )
+            })?;
+        let session = self.session().await?;
+        let selected_bytes = selected_files
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum::<u64>();
+        ensure_seed_capacity(&session, seed_config, &self.output_dir, selected_bytes).await
+    }
+
+    async fn session(&self) -> Result<Arc<Session>> {
+        if let Some(seed_config) = self.seed_config.as_ref() {
+            return seed_session(seed_config, self.peer_limit).await;
+        }
+        self.new_session(self.output_dir.clone(), None).await
+    }
+
+    async fn new_session(
+        &self,
+        output_dir: PathBuf,
+        seed_config: Option<&SeedConfig>,
+    ) -> Result<Arc<Session>> {
         Session::new_with_opts(
-            self.output_dir.clone(),
+            output_dir,
             SessionOptions {
                 dht: Some(DhtSessionConfig {
                     persistence: None,
                     ..Default::default()
                 }),
-                persistence: None,
+                fastresume: seed_config.is_some(),
+                persistence: seed_config.map(|seed_config| SessionPersistenceConfig::Json {
+                    folder: Some(seed_config.root_dir.join(".rqbit-session")),
+                }),
+                listen: seed_config.map(|seed_config| ListenerOptions {
+                    mode: ListenerMode::TcpAndUtp,
+                    listen_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, seed_config.listen_port)),
+                    announce_port: Some(seed_config.listen_port),
+                    ipv4_only: true,
+                    ..Default::default()
+                }),
                 peer_limit: Some(self.peer_limit),
                 disable_local_service_discovery: true,
                 ipv4_only: true,
@@ -190,6 +328,172 @@ impl TorrentDownloader {
         )
         .await
         .context("failed to create torrent session")
+    }
+}
+
+fn seed_download_lock() -> &'static Mutex<()> {
+    SEED_DOWNLOAD_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn seed_session(seed_config: &SeedConfig, peer_limit: usize) -> Result<Arc<Session>> {
+    // rqbit sessions own listener sockets and restored torrent handles, so the
+    // process keeps one shared session per seed configuration.
+    let key = SeedSessionKey {
+        root_dir: seed_config.root_dir.clone(),
+        listen_port: seed_config.listen_port,
+        peer_limit,
+    };
+    let sessions = SEED_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = sessions.lock().await;
+    if let Some(session) = guard.get(&key) {
+        return Ok(session.clone());
+    }
+    tokio::fs::create_dir_all(&seed_config.root_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create seed cache directory {}",
+                seed_config.root_dir.display()
+            )
+        })?;
+    let downloader = TorrentDownloader::new(seed_config.root_dir.clone(), peer_limit);
+    let session = downloader
+        .new_session(seed_config.root_dir.clone(), Some(seed_config))
+        .await?;
+    if let Some(addr) = session.listen_addr() {
+        info!(%addr, "torrent seed listener is active");
+    }
+    guard.insert(key, session.clone());
+    Ok(session)
+}
+
+async fn ensure_seed_capacity(
+    session: &Arc<Session>,
+    seed_config: &SeedConfig,
+    current_output_dir: &Path,
+    selected_bytes: u64,
+) -> Result<()> {
+    // We already know the selected files size before adding the torrent. Evict
+    // only when that known size plus the optional reserve will not fit.
+    let required_free_bytes = selected_bytes.saturating_add(seed_config.disk_reserve_bytes);
+    if has_required_space(&seed_config.root_dir, required_free_bytes)? {
+        return Ok(());
+    }
+
+    let mut ids = session.with_torrents(|torrents| {
+        let mut ids = torrents.map(|(id, _)| id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    });
+    for id in ids.drain(..) {
+        warn!(id, "evicting seeded torrent to free disk space");
+        if let Err(err) = session.delete(id.into(), true).await {
+            warn!(id, error = %err, "failed to delete seeded torrent during eviction");
+        }
+        if has_required_space(&seed_config.root_dir, required_free_bytes)? {
+            return Ok(());
+        }
+    }
+
+    remove_old_seed_dirs_until_enough(
+        &seed_config.root_dir,
+        current_output_dir,
+        required_free_bytes,
+    )
+    .await?;
+
+    if has_required_space(&seed_config.root_dir, required_free_bytes)? {
+        return Ok(());
+    }
+    let available = available_bytes(&seed_config.root_dir)?;
+    bail!(
+        "not enough disk space for torrent: need {} bytes available including reserve, have {}",
+        required_free_bytes,
+        available
+    )
+}
+
+fn has_required_space(path: &Path, required_free_bytes: u64) -> Result<bool> {
+    Ok(available_bytes(path)? >= required_free_bytes)
+}
+
+fn available_bytes(path: &Path) -> Result<u64> {
+    let stat = statvfs(path).with_context(|| {
+        format!(
+            "failed to read available filesystem space for {}",
+            path.display()
+        )
+    })?;
+    let bytes = (stat.blocks_available() as u128).saturating_mul(stat.fragment_size() as u128);
+    Ok(bytes.min(u64::MAX as u128) as u64)
+}
+
+async fn remove_old_seed_dirs_until_enough(
+    root_dir: &Path,
+    current_output_dir: &Path,
+    required_free_bytes: u64,
+) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(root_dir)
+        .await
+        .with_context(|| format!("failed to read seed cache directory {}", root_dir.display()))?;
+    let mut dirs = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path == current_output_dir {
+            continue;
+        }
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("rutracker-") {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        dirs.push((modified, path));
+    }
+    dirs.sort_by_key(|(modified, path)| (*modified, path.clone()));
+
+    for (_, path) in dirs {
+        warn!(path = %path.display(), "removing old seed directory to free disk space");
+        if let Err(err) = tokio::fs::remove_dir_all(&path).await {
+            warn!(path = %path.display(), error = %err, "failed to remove old seed directory");
+        }
+        if has_required_space(root_dir, required_free_bytes)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_stale_download_dirs(current_output_dir: &Path) {
+    let Some(parent) = current_output_dir.parent() else {
+        return;
+    };
+    let Some(current_name) = current_output_dir.file_name() else {
+        return;
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name == current_name || !name.to_string_lossy().starts_with("rutracker-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let _ = tokio::fs::remove_dir_all(path).await;
+        }
     }
 }
 
@@ -303,4 +607,26 @@ pub fn magnet_from_topic_or_metadata(
 
 pub fn torrent_bytes_as_add(bytes: Vec<u8>) -> AddTorrent<'static> {
     AddTorrent::from_bytes(Bytes::from(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_stale_download_dirs;
+
+    #[tokio::test]
+    async fn removes_stale_rutracker_download_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = tmp.path().join("rutracker-1-100");
+        let current = tmp.path().join("rutracker-2-200");
+        let unrelated = tmp.path().join("other");
+        tokio::fs::create_dir_all(&stale).await.unwrap();
+        tokio::fs::create_dir_all(&current).await.unwrap();
+        tokio::fs::create_dir_all(&unrelated).await.unwrap();
+
+        cleanup_stale_download_dirs(&current).await;
+
+        assert!(!stale.exists());
+        assert!(current.exists());
+        assert!(unrelated.exists());
+    }
 }

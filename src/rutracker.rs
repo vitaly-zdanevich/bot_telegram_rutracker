@@ -94,6 +94,7 @@ pub struct AuthorDetails {
 pub struct TopicComment {
     pub author: Option<AuthorDetails>,
     pub text: String,
+    pub html: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -535,6 +536,22 @@ fn description_text(body: ElementRef<'_>) -> String {
     for node in body.descendants() {
         match node.value() {
             Node::Text(value) => {
+                if let Some(spoiler_head) = node
+                    .ancestors()
+                    .filter_map(ElementRef::wrap)
+                    .find(|element| element_has_class(element.value(), "sp-head"))
+                    .map(text)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    push_description_blank_line(&mut out);
+                    push_description_newline(&mut out);
+                    out.push_str("== ");
+                    out.push_str(&spoiler_head);
+                    out.push_str(" ==");
+                    push_description_newline(&mut out);
+                    continue;
+                }
                 let in_pre = node
                     .ancestors()
                     .filter_map(ElementRef::wrap)
@@ -550,6 +567,9 @@ fn description_text(body: ElementRef<'_>) -> String {
                     || is_description_block(element.name())
                     || has_description_break_class(element) =>
             {
+                if element_has_class(element, "sp-wrap") || element_has_class(element, "post-b") {
+                    push_description_blank_line(&mut out);
+                }
                 push_description_newline(&mut out);
             }
             _ => {}
@@ -599,11 +619,15 @@ fn is_description_block(name: &str) -> bool {
 }
 
 fn has_description_break_class(element: &scraper::node::Element) -> bool {
-    element.attr("class").is_some_and(|class| {
-        class
-            .split_whitespace()
-            .any(|name| matches!(name, "post-b" | "sp-head" | "sp-body"))
-    })
+    ["post-b", "sp-head", "sp-body", "sp-wrap"]
+        .iter()
+        .any(|name| element_has_class(element, name))
+}
+
+fn element_has_class(element: &scraper::node::Element, class_name: &str) -> bool {
+    element
+        .attr("class")
+        .is_some_and(|class| class.split_whitespace().any(|name| name == class_name))
 }
 
 fn push_inline_description_text(out: &mut String, value: &str) {
@@ -637,13 +661,41 @@ fn push_description_newline(out: &mut String) {
     }
 }
 
+fn push_description_blank_line(out: &mut String) {
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return;
+    }
+    if out.ends_with("\n\n") {
+        return;
+    }
+    if out.ends_with('\n') {
+        out.push('\n');
+    } else {
+        out.push_str("\n\n");
+    }
+}
+
 fn normalize_description_text(value: &str) -> String {
-    value
-        .lines()
-        .map(|line| line.trim().replace(" :", ":"))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut normalized = Vec::new();
+    let mut previous_blank = false;
+    for line in value.lines().map(|line| line.trim().replace(" :", ":")) {
+        if line.is_empty() {
+            if !normalized.is_empty() && !previous_blank {
+                normalized.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+        normalized.push(line);
+        previous_blank = false;
+    }
+    while normalized.last().is_some_and(|line| line.is_empty()) {
+        normalized.pop();
+    }
+    normalized.join("\n")
 }
 
 fn attr_url(base_url: &Url, value: &str) -> Option<String> {
@@ -882,13 +934,8 @@ pub fn parse_topic_page(
     base_url: &Url,
 ) -> Result<TopicDetails> {
     let doc = Html::parse_document(html);
-    let first_visible_post = doc
-        .select(&selector(".post_wrap, .post, table.forumline tr"))
-        .find(|post| {
-            post.select(&selector(".post_body, td.message"))
-                .next()
-                .is_some()
-        });
+    let mut post_containers = post_containers(&doc);
+    let first_visible_post = post_containers.first().copied();
     let topic_post = if comments_page == 1 {
         first_visible_post
     } else {
@@ -910,23 +957,31 @@ pub fn parse_topic_page(
         .unwrap_or_default();
 
     let category_path = doc
-        .select(&selector("table.navTitle a[href*=\"viewforum.php?f=\"], td.nav a[href*=\"viewforum.php?f=\"], a[href*=\"viewforum.php?f=\"]"))
+        .select(&selector(
+            "table.navTitle a[href*=\"viewforum.php?f=\"], \
+             .navTitle a[href*=\"viewforum.php?f=\"], \
+             .breadcrumb a[href*=\"viewforum.php?f=\"], \
+             td.nav a[href*=\"viewforum.php?f=\"], \
+             td.t-breadcrumb-top a[href*=\"viewforum.php?f=\"]",
+        ))
         .filter_map(|link| {
-            let id = link.value().attr("href").and_then(extract_forum_id_from_href)?;
+            let id = link
+                .value()
+                .attr("href")
+                .and_then(extract_forum_id_from_href)?;
             let name = text(link);
             (!name.is_empty()).then_some(CategoryRef { id, name })
         })
         .collect::<Vec<_>>();
 
     let author = topic_post.and_then(|post| parse_author_from_post(post, base_url));
-    let description_body =
-        topic_post.and_then(|post| post.select(&selector(".post_body, td.message")).next());
+    let description_body = topic_post.and_then(topic_description_body);
 
     let description_html = description_body
         .map(|body| body.inner_html())
         .unwrap_or_default();
     let description_text = description_body.map(description_text).unwrap_or_default();
-    let release_type = extract_release_type(&description_text);
+    let release_type = extract_release_type(topic_post, description_body, &description_text);
     let first_post_images = description_body
         .map(|body| image_urls(body, base_url))
         .unwrap_or_default();
@@ -946,7 +1001,7 @@ pub fn parse_topic_page(
         .next()
         .and_then(|el| text(el).parse::<i64>().ok());
     let downloads = extract_topic_downloads(&doc);
-    let comments = parse_comments_from_doc(&doc, base_url, comments_page == 1);
+    let comments = parse_comments_from_posts(&mut post_containers, base_url, comments_page == 1);
     let comments_total_pages = extract_topic_total_pages(&doc)
         .unwrap_or(comments_page)
         .max(comments_page)
@@ -1052,26 +1107,41 @@ fn dedupe_files(files: Vec<TopicFile>) -> Vec<TopicFile> {
 }
 
 fn parse_author_from_post(post: ElementRef<'_>, base_url: &Url) -> Option<AuthorDetails> {
-    let linked_author = post
+    let author = post
         .select(&selector(
-            ".nick a, .poster_info a[href*=\"profile.php\"], .post-author a, p.nick a",
+            ".nick a, p.nick a, .nick, p.nick, .postauthor, .post-author a, .post-author",
         ))
-        .next();
-    let plain_author = || post.select(&selector(".nick, .post-author, p.nick")).next();
-    let author = linked_author.or_else(plain_author)?;
+        .next()?;
     let name = text(author);
     if name.is_empty() {
         return None;
     }
-    let profile_url = linked_author.and_then(|author| {
-        author
-            .value()
-            .attr("href")
-            .and_then(|href| attr_url(base_url, href))
-    });
+    let profile_url = author
+        .value()
+        .attr("href")
+        .filter(|href| href.contains("profile.php"))
+        .and_then(|href| attr_url(base_url, href))
+        .or_else(|| {
+            author_user_id_from_post(post).and_then(|user_id| profile_url(base_url, user_id))
+        })
+        .or_else(|| {
+            post.select(&selector(
+                ".poster_btn a[href*=\"profile.php?mode=viewprofile\"], \
+                 .poster_info a[href*=\"profile.php?mode=viewprofile\"], \
+                 .poster-profile a[href*=\"profile.php?mode=viewprofile\"], \
+                 .postdetails a[href*=\"profile.php?mode=viewprofile\"]",
+            ))
+            .next()
+            .and_then(|author| {
+                author
+                    .value()
+                    .attr("href")
+                    .and_then(|href| attr_url(base_url, href))
+            })
+        });
     let posts_count = post
         .select(&selector(
-            ".poster_info, .joined, .post-author-details, td.row1",
+            ".poster_info, .poster-profile, .postdetails, .joined, .post-author-details, td.row1",
         ))
         .map(text)
         .find_map(|value| {
@@ -1085,7 +1155,9 @@ fn parse_author_from_post(post: ElementRef<'_>, base_url: &Url) -> Option<Author
                 .ok()
         });
     let avatar_url = post
-        .select(&selector("img.avatar, .poster_info img, td.row1 img"))
+        .select(&selector(
+            "img.avatar, .poster_info img, .poster-profile img, .postdetails img, td.row1 img",
+        ))
         .find_map(|img| {
             img.value()
                 .attr("src")
@@ -1100,11 +1172,40 @@ fn parse_author_from_post(post: ElementRef<'_>, base_url: &Url) -> Option<Author
     })
 }
 
+fn author_user_id_from_post(post: ElementRef<'_>) -> Option<u64> {
+    post.select(&selector("[data-ext_link_data]"))
+        .find_map(|element| {
+            let data = element.value().attr("data-ext_link_data")?;
+            Regex::new(r#""u"\s*:\s*(\d+)"#)
+                .ok()?
+                .captures(data)?
+                .get(1)?
+                .as_str()
+                .parse()
+                .ok()
+        })
+}
+
+fn profile_url(base_url: &Url, user_id: u64) -> Option<String> {
+    attr_url(
+        base_url,
+        &format!("profile.php?mode=viewprofile&u={user_id}"),
+    )
+}
+
+fn topic_description_body(post: ElementRef<'_>) -> Option<ElementRef<'_>> {
+    post.select(&selector(".post_body"))
+        .next()
+        .or_else(|| post.select(&selector("td.message")).next())
+}
+
 fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
-    for img in body.select(&selector("img")) {
-        let Some(src) = img.value().attr("src") else {
+    // RuTracker renders some BBCode images as a var.postImg element whose
+    // title contains the real image URL instead of using <img src=...>.
+    for image in body.select(&selector("var.postImg[title]")) {
+        let Some(src) = image.value().attr("title") else {
             continue;
         };
         let Some(url) = attr_url(base_url, src) else {
@@ -1114,40 +1215,260 @@ fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
             urls.push(url);
         }
     }
+    for img in body.select(&selector("img")) {
+        let Some(src) = img.value().attr("src") else {
+            continue;
+        };
+        let Some(url) = attr_url(base_url, src) else {
+            continue;
+        };
+        if is_rutracker_ui_image(&url) {
+            continue;
+        }
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
     urls
 }
 
-fn parse_comments_from_doc(doc: &Html, base_url: &Url, skip_first_post: bool) -> Vec<TopicComment> {
+fn is_rutracker_ui_image(url: &str) -> bool {
+    url.contains("static.rutracker.cc/templates/")
+        || url.contains("static.rutracker.cc/smiles/")
+        || url.contains("/templates/")
+        || url.contains("/smiles/")
+}
+
+fn parse_author_near_body(body: ElementRef<'_>, base_url: &Url) -> Option<AuthorDetails> {
+    parse_author_from_post(body, base_url).or_else(|| {
+        body.ancestors()
+            .filter_map(ElementRef::wrap)
+            .take(12)
+            .filter(|candidate| {
+                candidate
+                    .select(&selector(".post_body, td.message"))
+                    .take(2)
+                    .count()
+                    <= 1
+            })
+            .find_map(|candidate| parse_author_from_post(candidate, base_url))
+    })
+}
+
+fn post_containers(doc: &Html) -> Vec<ElementRef<'_>> {
+    let modern = doc
+        .select(&selector("tbody[id^=\"post_\"]"))
+        .filter(|post| topic_description_body(*post).is_some())
+        .collect::<Vec<_>>();
+    if !modern.is_empty() {
+        return modern;
+    }
+
+    let forumline_rows = doc
+        .select(&selector("table.forumline tr[id]"))
+        .filter(|post| topic_description_body(*post).is_some())
+        .collect::<Vec<_>>();
+    if !forumline_rows.is_empty() {
+        return forumline_rows;
+    }
+
+    doc.select(&selector(".post_wrap, .post"))
+        .filter(|post| topic_description_body(*post).is_some())
+        .collect()
+}
+
+fn parse_comments_from_posts(
+    posts: &mut [ElementRef<'_>],
+    base_url: &Url,
+    skip_first_post: bool,
+) -> Vec<TopicComment> {
     let mut comments = Vec::new();
-    for (index, post) in doc
-        .select(&selector(".post_wrap, .post, table.forumline tr"))
-        .filter(|post| {
-            post.select(&selector(".post_body, td.message"))
-                .next()
-                .is_some()
-        })
-        .enumerate()
-    {
+    for (index, post) in posts.iter().enumerate() {
         if skip_first_post && index == 0 {
             continue;
         }
-        let text = post
-            .select(&selector(".post_body, td.message"))
-            .next()
-            .map(text)
-            .unwrap_or_default();
+        let Some(body) = topic_description_body(*post) else {
+            continue;
+        };
+        let text = normalize_comment_plain_text(&text(body));
         if text.is_empty() {
             continue;
         }
         comments.push(TopicComment {
-            author: parse_author_from_post(post, base_url),
+            author: parse_author_from_post(*post, base_url)
+                .or_else(|| parse_author_near_body(body, base_url)),
             text,
+            html: comment_html(body, base_url),
         });
-        if comments.len() >= 10 {
-            break;
-        }
     }
     comments
+}
+
+fn comment_html(body: ElementRef<'_>, base_url: &Url) -> String {
+    let mut out = String::new();
+    for node in body.descendants() {
+        match node.value() {
+            Node::Text(value) => {
+                if node
+                    .ancestors()
+                    .filter_map(ElementRef::wrap)
+                    .any(|element| matches!(element.value().name(), "script" | "style"))
+                {
+                    continue;
+                }
+                let Some(fragment) = normalize_comment_text_fragment(value) else {
+                    continue;
+                };
+                push_comment_text_fragment(
+                    &mut out,
+                    &fragment,
+                    comment_markup_stack(node.ancestors().filter_map(ElementRef::wrap), base_url),
+                );
+            }
+            Node::Element(element)
+                if element.name() == "br"
+                    || is_description_block(element.name())
+                    || has_description_break_class(element) =>
+            {
+                push_comment_newline(&mut out);
+            }
+            _ => {}
+        }
+    }
+    normalize_comment_html(&out)
+}
+
+fn normalize_comment_plain_text(value: &str) -> String {
+    value
+        .replace(" .", ".")
+        .replace(" ,", ",")
+        .replace(" :", ":")
+        .replace(" ;", ";")
+        .replace(" !", "!")
+        .replace(" ?", "?")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CommentMarkup {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Spoiler,
+    Code,
+    Link(String),
+}
+
+fn comment_markup_stack<'a>(
+    ancestors: impl Iterator<Item = ElementRef<'a>>,
+    base_url: &Url,
+) -> Vec<CommentMarkup> {
+    let mut stack = Vec::new();
+    for element in ancestors.collect::<Vec<_>>().into_iter().rev() {
+        let name = element.value().name();
+        if let "body" | "html" | "document" = name {
+            continue;
+        }
+        if name == "a" {
+            if let Some(url) = element
+                .value()
+                .attr("href")
+                .and_then(|href| attr_url(base_url, href))
+            {
+                stack.push(CommentMarkup::Link(url));
+            }
+            continue;
+        }
+        match name {
+            "b" | "strong" => stack.push(CommentMarkup::Bold),
+            "i" | "em" => stack.push(CommentMarkup::Italic),
+            "u" | "ins" => stack.push(CommentMarkup::Underline),
+            "s" | "strike" | "del" => stack.push(CommentMarkup::Strike),
+            "tg-spoiler" => stack.push(CommentMarkup::Spoiler),
+            "code" | "pre" => stack.push(CommentMarkup::Code),
+            _ => {
+                if element_has_class(element.value(), "post-b") {
+                    stack.push(CommentMarkup::Bold);
+                }
+                if element_has_class(element.value(), "post-i") {
+                    stack.push(CommentMarkup::Italic);
+                }
+                if element_has_class(element.value(), "post-u") {
+                    stack.push(CommentMarkup::Underline);
+                }
+                if element_has_class(element.value(), "post-s") {
+                    stack.push(CommentMarkup::Strike);
+                }
+                if element_has_class(element.value(), "spoiler") {
+                    stack.push(CommentMarkup::Spoiler);
+                }
+            }
+        }
+    }
+    stack
+}
+
+fn push_comment_text_fragment(out: &mut String, fragment: &str, stack: Vec<CommentMarkup>) {
+    if !out.is_empty() && !out.ends_with('\n') && !starts_with_no_space_punctuation(fragment) {
+        out.push(' ');
+    }
+    let mut escaped = html_escape::encode_text(fragment).to_string();
+    for markup in stack.iter().rev() {
+        escaped = match markup {
+            CommentMarkup::Bold => format!("<b>{escaped}</b>"),
+            CommentMarkup::Italic => format!("<i>{escaped}</i>"),
+            CommentMarkup::Underline => format!("<u>{escaped}</u>"),
+            CommentMarkup::Strike => format!("<s>{escaped}</s>"),
+            CommentMarkup::Spoiler => format!("<tg-spoiler>{escaped}</tg-spoiler>"),
+            CommentMarkup::Code => format!("<code>{escaped}</code>"),
+            CommentMarkup::Link(url) => format!(
+                "<a href=\"{}\">{escaped}</a>",
+                html_escape::encode_double_quoted_attribute(url)
+            ),
+        };
+    }
+    out.push_str(&escaped);
+}
+
+fn normalize_comment_text_fragment(value: &str) -> Option<String> {
+    let fragment = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!fragment.is_empty()).then_some(fragment)
+}
+
+fn starts_with_no_space_punctuation(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, ':' | ',' | '.' | ';' | '!' | '?' | ')' | ']' | '}'))
+}
+
+fn push_comment_newline(out: &mut String) {
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn normalize_comment_html(value: &str) -> String {
+    let mut normalized = Vec::new();
+    let mut previous_blank = false;
+    for line in value.lines().map(|line| line.trim()) {
+        if line.is_empty() {
+            if !normalized.is_empty() && !previous_blank {
+                normalized.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+        normalized.push(line.to_string());
+        previous_blank = false;
+    }
+    while normalized.last().is_some_and(|line| line.is_empty()) {
+        normalized.pop();
+    }
+    normalized.join("\n")
 }
 
 fn extract_topic_total_pages(doc: &Html) -> Option<u32> {
@@ -1194,11 +1515,40 @@ fn parse_torrent_downloads_from_text(value: &str) -> Option<u64> {
     parse_human_u64(captures.get(1)?.as_str())
 }
 
-fn extract_release_type(description_text: &str) -> Option<String> {
-    Regex::new(r"(?i)тип\s*:\s*авторская")
+fn extract_release_type(
+    topic_post: Option<ElementRef<'_>>,
+    description_body: Option<ElementRef<'_>>,
+    description_text: &str,
+) -> Option<String> {
+    if Regex::new(r"(?i)тип\s*:\s*авторская")
         .ok()?
         .is_match(description_text)
+    {
+        return Some("авторская".to_string());
+    }
+    if topic_post.is_some_and(|post| {
+        Regex::new(r"(?i)тип\s*:\s*авторская")
+            .ok()
+            .is_some_and(|pattern| pattern.is_match(&text(post)))
+    }) {
+        return Some("авторская".to_string());
+    }
+
+    description_body
+        .is_some_and(has_author_release_marker)
         .then(|| "авторская".to_string())
+}
+
+fn has_author_release_marker(body: ElementRef<'_>) -> bool {
+    body.select(&selector("img[src], var[title]"))
+        .any(|element| {
+            ["src", "title"].iter().any(|attr| {
+                element
+                    .value()
+                    .attr(attr)
+                    .is_some_and(|value| value.to_lowercase().contains("authors_release"))
+            })
+        })
 }
 
 fn extract_publication_date_from_post(post: ElementRef<'_>) -> Option<String> {
@@ -1217,7 +1567,7 @@ fn extract_publication_date_from_description(description_text: &str) -> Option<S
     if let Some(value) = labeled_date
         .captures(description_text)
         .and_then(|captures| captures.get(1))
-        .map(|capture| capture.as_str().trim().to_string())
+        .and_then(|capture| normalize_publication_date(capture.as_str()))
     {
         return Some(value);
     }
@@ -1230,6 +1580,16 @@ fn extract_publication_date_from_description(description_text: &str) -> Option<S
 }
 
 fn parse_publication_date_text(value: &str) -> Option<String> {
+    let date = r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?|\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[-\s]\p{L}{3,}[-\s]\d{2,4}(?:\s+\d{1,2}:\d{2})?)";
+    if let Some(date) = Regex::new(&format!(r"(?i)(?:ред\.?|edited)\s*{date}"))
+        .ok()
+        .and_then(|pattern| pattern.captures(value))
+        .and_then(|captures| captures.get(1))
+        .and_then(|matched| normalize_publication_date(matched.as_str()))
+    {
+        return Some(date);
+    }
+
     let date_patterns = [
         r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?",
         r"\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?",
@@ -1239,8 +1599,104 @@ fn parse_publication_date_text(value: &str) -> Option<String> {
         Regex::new(pattern)
             .ok()?
             .find(value)
-            .map(|matched| matched.as_str().trim().to_string())
+            .and_then(|matched| normalize_publication_date(matched.as_str()))
     })
+}
+
+fn normalize_publication_date(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(captures) = Regex::new(r"(?i)^(\d{4})-(\d{1,2})-(\d{1,2})")
+        .ok()?
+        .captures(value)
+    {
+        return format_ymd(
+            captures.get(1)?.as_str(),
+            captures.get(2)?.as_str(),
+            captures.get(3)?.as_str(),
+        );
+    }
+    if let Some(captures) = Regex::new(r"(?i)^(\d{1,2})[./](\d{1,2})[./](\d{2,4})")
+        .ok()?
+        .captures(value)
+    {
+        return format_ymd(
+            captures.get(3)?.as_str(),
+            captures.get(2)?.as_str(),
+            captures.get(1)?.as_str(),
+        );
+    }
+    if let Some(captures) = Regex::new(r"(?i)^(\d{1,2})[-\s](\p{L}{3,})[-\s](\d{2,4})")
+        .ok()?
+        .captures(value)
+    {
+        let month = month_name(captures.get(2)?.as_str())?;
+        return format_date_parts(
+            normalize_year(captures.get(3)?.as_str())?,
+            month,
+            captures.get(1)?.as_str().parse().ok()?,
+        );
+    }
+    Regex::new(r"^\d{4}$")
+        .ok()?
+        .is_match(value)
+        .then(|| value.to_string())
+}
+
+fn format_ymd(year: &str, month: &str, day: &str) -> Option<String> {
+    let year = normalize_year(year)?;
+    let month = month_name(month)?;
+    let day = day.parse().ok()?;
+    format_date_parts(year, month, day)
+}
+
+fn format_date_parts(year: u16, month: &'static str, day: u8) -> Option<String> {
+    (1..=31)
+        .contains(&day)
+        .then(|| format!("{year}-{month}-{day:02}"))
+}
+
+fn normalize_year(year: &str) -> Option<u16> {
+    let value: u16 = year.parse().ok()?;
+    Some(if year.len() == 2 {
+        if value >= 70 {
+            1900 + value
+        } else {
+            2000 + value
+        }
+    } else {
+        value
+    })
+}
+
+fn month_name(value: &str) -> Option<&'static str> {
+    let value = value.trim_matches('.').to_lowercase();
+    match value.as_str() {
+        "1" | "01" | "jan" | "january" | "янв" | "январь" | "января" => {
+            Some("january")
+        }
+        "2" | "02" | "feb" | "february" | "фев" | "февраль" | "февраля" => {
+            Some("february")
+        }
+        "3" | "03" | "mar" | "march" | "мар" | "март" | "марта" => Some("march"),
+        "4" | "04" | "apr" | "april" | "апр" | "апрель" | "апреля" => Some("april"),
+        "5" | "05" | "may" | "май" | "мая" => Some("may"),
+        "6" | "06" | "jun" | "june" | "июн" | "июнь" | "июня" => Some("june"),
+        "7" | "07" | "jul" | "july" | "июл" | "июль" | "июля" => Some("july"),
+        "8" | "08" | "aug" | "august" | "авг" | "август" | "августа" => {
+            Some("august")
+        }
+        "9" | "09" | "sep" | "sept" | "september" | "сен" | "сент" | "сентябрь" | "сентября" => {
+            Some("september")
+        }
+        "10" | "oct" | "october" | "окт" | "октябрь" | "октября" => {
+            Some("october")
+        }
+        "11" | "nov" | "november" | "ноя" | "ноябрь" | "ноября" => Some("november"),
+        "12" | "dec" | "december" | "дек" | "декабрь" | "декабря" => {
+            Some("december")
+        }
+        _ => None,
+    }
 }
 
 fn parse_human_u64(value: &str) -> Option<u64> {
@@ -1420,6 +1876,8 @@ mod tests {
         let html = include_str!("../tests/fixtures/rutracker/topic.html");
         let topic = parse_topic(html, 6849001, &base()).unwrap();
         assert_eq!(topic.title, "Legal Indie Album - 2026 [FLAC]");
+        assert_eq!(topic.category_path.last().unwrap().id, 123);
+        assert_eq!(topic.category_path.last().unwrap().name, "Indie Music");
         assert_eq!(topic.author.as_ref().unwrap().name, "artist");
         assert!(
             topic
@@ -1433,7 +1891,7 @@ mod tests {
         );
         assert_eq!(topic.author.as_ref().unwrap().posts_count, Some(321));
         assert_eq!(topic.release_type.as_deref(), Some("авторская"));
-        assert_eq!(topic.publication_date.as_deref(), Some("07-Jun-26 12:34"));
+        assert_eq!(topic.publication_date.as_deref(), Some("2026-june-07"));
         assert_eq!(topic.downloads, Some(295));
         assert!(topic.description_text.contains(
             "Тип: авторская\nReleased by the author under a permissive license.\n.torrent скачан: 295 раз"
@@ -1444,7 +1902,7 @@ mod tests {
                 .contains("01 - First Track.flac - 30 MB\n02 - Second Track.flac - 9 MB")
         );
         assert!(topic.description_text.contains(
-            "Об исполнителе (группе)\nДепрессивно, трансцедентально.\nДоп. информация: Источник: официальный сайт https://example.invalid/source"
+            "== Об исполнителе (группе) ==\nДепрессивно, трансцедентально.\n\n== Об альбоме (сборнике) ==\nRecorded at home and published by the author.\n\nДоп. информация: Источник: официальный сайт https://example.invalid/source"
         ));
         assert!(
             topic
@@ -1456,7 +1914,16 @@ mod tests {
                 .unwrap()
                 .contains("avatar.jpg")
         );
-        assert_eq!(topic.first_post_images.len(), 2);
+        assert_eq!(topic.first_post_images.len(), 3);
+        assert_eq!(
+            topic.first_post_images[0],
+            "https://img.example/wrapper-cover.png"
+        );
+        assert_eq!(topic.first_post_images[1], "https://img.example/cover.jpg");
+        assert_eq!(
+            topic.first_post_images[2],
+            "https://rutracker.org/images/back.jpg"
+        );
         assert_eq!(topic.first_post_files.len(), 3);
         assert_eq!(topic.first_post_files[0].size_bytes, Some(31_457_280));
         assert!(
@@ -1467,8 +1934,248 @@ mod tests {
                 .starts_with("magnet:?xt=urn:btih:")
         );
         assert_eq!(topic.comments.len(), 2);
+        assert_eq!(topic.comments[0].author.as_ref().unwrap().name, "listener");
+        assert_eq!(
+            topic.comments[0].author.as_ref().unwrap().posts_count,
+            Some(12)
+        );
+        assert_eq!(
+            topic.comments[0].text,
+            "Thank you for publishing this. Please keep seeding."
+        );
+        assert!(topic.comments[0].html.contains(
+            "Thank you for <a href=\"https://rutracker.org/forum/viewtopic.php?t=5733243\">publishing this</a>."
+        ));
+        assert!(topic.comments[0].html.contains("Please keep seeding."));
+        assert!(!topic.comments[0].html.contains("style="));
+        assert!(!topic.comments[0].html.contains("<span"));
+        assert_eq!(topic.comments[1].author.as_ref().unwrap().name, "curator");
+        assert_eq!(
+            topic.comments[1].author.as_ref().unwrap().posts_count,
+            Some(77)
+        );
         assert_eq!(topic.comments_page, 1);
         assert_eq!(topic.comments_total_pages, 6);
+    }
+
+    #[test]
+    fn parses_first_post_author_release_marker() {
+        let html = r##"
+            <html>
+                <body>
+                    <h1 class="maintitle">Legal Indie Album</h1>
+                    <div class="post_wrap">
+                        <div class="post_body">
+                            <var class="postImg" title="https://static.rutracker.cc/pic/artsovet/authors_release.png"></var>
+                            <span class="post-b">Genre</span>: Indie
+                        </div>
+                    </div>
+                </body>
+            </html>
+        "##;
+
+        let topic = parse_topic(html, 1, &base()).unwrap();
+
+        assert_eq!(topic.release_type.as_deref(), Some("авторская"));
+    }
+
+    #[test]
+    fn ignores_later_post_author_release_marker() {
+        let html = r#"
+            <html>
+                <body>
+                    <h1 class="maintitle">Legal Indie Album</h1>
+                    <div class="post_wrap">
+                        <div class="post_body">
+                            <span class="post-b">Genre</span>: Indie
+                        </div>
+                    </div>
+                    <div class="post_wrap">
+                        <div class="post_body">
+                            <var class="postImg" title="https://static.rutracker.cc/pic/artsovet/authors_release.png"></var>
+                        </div>
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        let topic = parse_topic(html, 1, &base()).unwrap();
+
+        assert_eq!(topic.release_type, None);
+    }
+
+    #[test]
+    fn parses_modern_post_container_author_and_edited_date() {
+        let html = r##"
+            <html>
+                <body>
+                    <h1 class="maintitle">Legal Indie Album</h1>
+                    <table class="topic">
+                        <tbody id="post_77389736" class="row1">
+                            <tr>
+                                <td class="poster_info">
+                                    <p class="nick nick-author"><a href="#" onclick="return false;">vnon</a></p>
+                                    <p class="posts"><em>Сообщений:</em> 184</p>
+                                </td>
+                                <td class="message">
+                                    <div class="post_head">
+                                        <p class="post-time">
+                                            <img src="https://static.rutracker.cc/templates/v1/images/icon_minipost.gif" alt="">
+                                            <a class="p-link small" href="viewtopic.php?t=5733243">18-Май-19 00:09</a>
+                                            <span class="posted_since hide-for-print">(7 лет назад, ред. 04-Июн-19 22:28)</span>
+                                        </p>
+                                    </div>
+                                    <div class="post_wrap">
+                                        <div class="post_body" data-ext_link_data='{"p":82877079,"t":6190907,"f":441,"u":12610477}'>
+                                            <var class="postImg postImgAligned img-right" title="https://img.example/cover.jpg"></var>
+                                            First post text.
+                                        </div>
+                                    </div>
+                                    <table class="attach">
+                                        <tr>
+                                            <td>Тип:</td>
+                                            <td><span><b>авторская</b></span></td>
+                                        </tr>
+                                        <tr>
+                                            <td>Статус:</td>
+                                            <td><a href="profile.php?mode=viewprofile&amp;u=43642585">DJ Stakan</a></td>
+                                        </tr>
+                                    </table>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </body>
+            </html>
+        "##;
+
+        let topic = parse_topic(html, 5733243, &base()).unwrap();
+        let author = topic.author.as_ref().unwrap();
+
+        assert_eq!(author.name, "vnon");
+        assert_eq!(author.posts_count, Some(184));
+        assert!(
+            author
+                .profile_url
+                .as_ref()
+                .unwrap()
+                .contains("profile.php?mode=viewprofile&u=12610477")
+        );
+        assert_eq!(topic.release_type.as_deref(), Some("авторская"));
+        assert_eq!(topic.publication_date.as_deref(), Some("2019-june-04"));
+        assert_eq!(
+            topic.first_post_images,
+            vec!["https://img.example/cover.jpg"]
+        );
+    }
+
+    #[test]
+    fn parses_modern_comment_authors() {
+        let html = r##"
+            <html>
+                <body>
+                    <h1 class="maintitle">Legal Indie Album</h1>
+                    <table class="topic">
+                        <tbody id="post_1" class="row1">
+                            <tr>
+                                <td class="poster_info">
+                                    <p class="nick nick-author">topic_author</p>
+                                </td>
+                                <td class="message">
+                                    <div class="post_wrap">
+                                        <div class="post_body" data-ext_link_data='{"p":1,"t":42,"f":441,"u":11}'>First post.</div>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                        <tbody id="post_2" class="row2">
+                            <tr>
+                                <td class="poster_info">
+                                    <p class="nick nick-author"><a href="#" onclick="return false;">listener</a></p>
+                                    <p class="posts"><em>Сообщений:</em> 12</p>
+                                </td>
+                                <td class="message">
+                                    <div class="post_wrap">
+                                        <div class="post_body" data-ext_link_data='{"p":2,"t":42,"f":441,"u":22}'>Comment text.</div>
+                                    </div>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td class="poster_btn">
+                                    <a class="txtb" href="profile.php?mode=viewprofile&amp;u=22">[Профиль]</a>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </body>
+            </html>
+        "##;
+
+        let topic = parse_topic(html, 42, &base()).unwrap();
+
+        assert_eq!(topic.comments.len(), 1);
+        let author = topic.comments[0].author.as_ref().unwrap();
+        assert_eq!(author.name, "listener");
+        assert_eq!(author.posts_count, Some(12));
+        assert!(
+            author
+                .profile_url
+                .as_ref()
+                .unwrap()
+                .contains("profile.php?mode=viewprofile&u=22")
+        );
+        assert_eq!(topic.comments[0].html, "Comment text.");
+    }
+
+    #[test]
+    fn parses_nested_forumline_comment_authors() {
+        let html = r#"
+        <html>
+          <head><title>Nested topic :: RuTracker.org</title></head>
+          <body>
+            <table class="forumline">
+              <tr id="p1">
+                <td class="row1">
+                  <span class="postdetails poster-profile">
+                    <a href="profile.php?mode=viewprofile&amp;u=11"><b class="postauthor">topic_author</b></a>
+                    <span>Сообщений: 10</span>
+                  </span>
+                </td>
+                <td class="row1">
+                  <table class="post"><tr><td><div class="post_body">First post text.</div></td></tr></table>
+                </td>
+              </tr>
+              <tr id="p2">
+                <td class="row1">
+                  <span class="postdetails poster-profile">
+                    <a href="profile.php?mode=viewprofile&amp;u=22"><b class="postauthor">listener</b></a>
+                    <span>Сообщений: 12</span>
+                  </span>
+                </td>
+                <td class="row1">
+                  <table class="post"><tr><td><div class="post_body">Comment text.</div></td></tr></table>
+                </td>
+              </tr>
+            </table>
+          </body>
+        </html>
+        "#;
+
+        let topic = parse_topic(html, 42, &base()).unwrap();
+
+        assert_eq!(topic.comments.len(), 1);
+        let author = topic.comments[0].author.as_ref().unwrap();
+        assert_eq!(author.name, "listener");
+        assert_eq!(author.posts_count, Some(12));
+        assert!(
+            author
+                .profile_url
+                .as_ref()
+                .unwrap()
+                .contains("profile.php?mode=viewprofile")
+        );
+        assert_eq!(topic.comments[0].text, "Comment text.");
+        assert_eq!(topic.comments[0].html, "Comment text.");
     }
 
     #[test]

@@ -8,16 +8,23 @@ use crate::TELEGRAM_MAX_FILE_MB_DEFAULT;
 
 const DEFAULT_RUTRACKER_BASE_URLS: &str =
     "https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum";
+const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const DEFAULT_HTTP_TIMEOUT_SECONDS: u64 = 25;
 const DEFAULT_HTTP_MAX_ATTEMPTS: usize = 10;
 const DEFAULT_LAMBDA_TIMEOUT_SECONDS: u64 = 900;
 const DEFAULT_DOWNLOAD_MARGIN_SECONDS: u64 = 20;
+const DEFAULT_DOWNLOAD_COUNTDOWN_LABEL: &str = "AWS Lambda lifetime";
+const DEFAULT_DOWNLOAD_STATUS_INTERVAL_SECONDS: u64 = 60;
 const DEFAULT_PEER_LIMIT: usize = 120;
+const DEFAULT_SEED_TORRENTS: bool = false;
+const DEFAULT_TORRENT_LISTEN_PORT: u16 = 49152;
+const DEFAULT_SEED_DISK_RESERVE_MB: u64 = 0;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub telegram_bot_token: String,
+    pub telegram_api_base_url: String,
     pub telegram_webhook_secret: String,
     pub allowed_telegram_user_ids: HashSet<i64>,
     pub rutracker_base_urls: Vec<String>,
@@ -31,7 +38,12 @@ pub struct Config {
     pub max_file_mb: u64,
     pub lambda_timeout_seconds: u64,
     pub download_margin_seconds: u64,
+    pub download_countdown_label: String,
+    pub download_status_interval_seconds: u64,
     pub peer_limit: usize,
+    pub seed_torrents: bool,
+    pub torrent_listen_port: u16,
+    pub seed_disk_reserve_mb: u64,
 }
 
 impl Config {
@@ -43,6 +55,9 @@ impl Config {
 
         Ok(Self {
             telegram_bot_token: required_env("TELEGRAM_BOT_TOKEN")?,
+            telegram_api_base_url: parse_telegram_api_base_url(
+                optional_env("TELEGRAM_API_BASE_URL").as_deref(),
+            )?,
             telegram_webhook_secret: required_env("TELEGRAM_WEBHOOK_SECRET")?,
             allowed_telegram_user_ids: parse_allowed_telegram_user_ids()?,
             rutracker_base_urls: parse_rutracker_base_urls()?,
@@ -66,7 +81,17 @@ impl Config {
                 "DOWNLOAD_MARGIN_SECONDS",
                 DEFAULT_DOWNLOAD_MARGIN_SECONDS,
             )?,
+            download_countdown_label: optional_env("DOWNLOAD_COUNTDOWN_LABEL")
+                .unwrap_or_else(|| DEFAULT_DOWNLOAD_COUNTDOWN_LABEL.to_string()),
+            download_status_interval_seconds: parse_env(
+                "DOWNLOAD_STATUS_INTERVAL_SECONDS",
+                DEFAULT_DOWNLOAD_STATUS_INTERVAL_SECONDS,
+            )?
+            .max(1),
             peer_limit: parse_env("TORRENT_PEER_LIMIT", DEFAULT_PEER_LIMIT)?,
+            seed_torrents: parse_env("SEED_TORRENTS", DEFAULT_SEED_TORRENTS)?,
+            torrent_listen_port: parse_env("TORRENT_LISTEN_PORT", DEFAULT_TORRENT_LISTEN_PORT)?,
+            seed_disk_reserve_mb: parse_env("SEED_DISK_RESERVE_MB", DEFAULT_SEED_DISK_RESERVE_MB)?,
         })
     }
 
@@ -153,6 +178,19 @@ pub fn parse_rutracker_credentials(
     }
 }
 
+pub fn parse_telegram_api_base_url(value: Option<&str>) -> Result<String> {
+    let value = value.unwrap_or(DEFAULT_TELEGRAM_API_BASE_URL).trim();
+    if value.is_empty() {
+        bail!("TELEGRAM_API_BASE_URL must not be empty");
+    }
+    let parsed = url::Url::parse(value)
+        .with_context(|| format!("TELEGRAM_API_BASE_URL has invalid URL {value:?}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(value.trim_end_matches('/').to_string()),
+        scheme => bail!("TELEGRAM_API_BASE_URL must use http or https, got {scheme:?}"),
+    }
+}
+
 pub fn parse_telegram_user_id_set(value: Option<&str>) -> Result<HashSet<i64>> {
     let Some(value) = value else {
         return Ok(HashSet::new());
@@ -179,7 +217,8 @@ pub fn parse_telegram_user_id_set(value: Option<&str>) -> Result<HashSet<i64>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_rutracker_base_url_list, parse_rutracker_credentials, parse_telegram_user_id_set,
+        parse_rutracker_base_url_list, parse_rutracker_credentials, parse_telegram_api_base_url,
+        parse_telegram_user_id_set,
     };
 
     #[test]
@@ -221,5 +260,18 @@ mod tests {
             parse_rutracker_credentials(None, None).unwrap(),
             (None, None)
         );
+    }
+
+    #[test]
+    fn parses_telegram_api_base_url() {
+        assert_eq!(
+            parse_telegram_api_base_url(None).unwrap(),
+            "https://api.telegram.org"
+        );
+        assert_eq!(
+            parse_telegram_api_base_url(Some("http://127.0.0.1:8081/")).unwrap(),
+            "http://127.0.0.1:8081"
+        );
+        assert!(parse_telegram_api_base_url(Some("ftp://example.test")).is_err());
     }
 }

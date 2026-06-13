@@ -12,28 +12,41 @@ data "aws_iam_policy_document" "lambda_assume_role" {
 locals {
   worker_function_name = "${var.project_name}-worker"
 
-  webhook_environment_variables = {
-    TELEGRAM_WEBHOOK_SECRET = var.telegram_webhook_secret
-    WORKER_FUNCTION_NAME    = local.worker_function_name
-    RUST_LOG                = "info"
-  }
+  webhook_environment_variables = merge(
+    {
+      TELEGRAM_WEBHOOK_SECRET = var.telegram_webhook_secret
+      WORKER_FUNCTION_NAME    = local.worker_function_name
+      RUST_LOG                = "info"
+    },
+    var.vm_worker_url == "" ? {} : {
+      VM_WORKER_URL        = var.vm_worker_url
+      VM_WORKER_TIMEOUT_MS = tostring(var.vm_worker_timeout_ms)
+    },
+    var.vm_worker_secret == "" ? {} : {
+      VM_WORKER_SECRET = var.vm_worker_secret
+    }
+  )
 
   worker_environment_variables = merge(
     {
-      TELEGRAM_BOT_TOKEN             = var.telegram_bot_token
-      TELEGRAM_WEBHOOK_SECRET        = var.telegram_webhook_secret
-      RUTRACKER_BASE_URLS            = var.rutracker_base_urls
-      SEARCH_LIMIT                   = "10"
-      RUTRACKER_HTTP_TIMEOUT_SECONDS = "30"
-      RUTRACKER_HTTP_MAX_ATTEMPTS    = "10"
-      MAX_FILE_MB                    = "50"
-      LAMBDA_TIMEOUT_SECONDS         = "900"
-      DOWNLOAD_MARGIN_SECONDS        = "20"
-      TORRENT_PEER_LIMIT             = "120"
-      RUST_LOG                       = "info"
+      TELEGRAM_BOT_TOKEN               = var.telegram_bot_token
+      TELEGRAM_WEBHOOK_SECRET          = var.telegram_webhook_secret
+      RUTRACKER_BASE_URLS              = var.rutracker_base_urls
+      SEARCH_LIMIT                     = "10"
+      RUTRACKER_HTTP_TIMEOUT_SECONDS   = "30"
+      RUTRACKER_HTTP_MAX_ATTEMPTS      = "10"
+      MAX_FILE_MB                      = "50"
+      LAMBDA_TIMEOUT_SECONDS           = "900"
+      DOWNLOAD_MARGIN_SECONDS          = "20"
+      DOWNLOAD_STATUS_INTERVAL_SECONDS = "60"
+      TORRENT_PEER_LIMIT               = "120"
+      RUST_LOG                         = "info"
     },
     var.allowed_telegram_user_ids == "" ? {} : {
       ALLOWED_TELEGRAM_USER_IDS = var.allowed_telegram_user_ids
+    },
+    var.telegram_api_base_url == "" ? {} : {
+      TELEGRAM_API_BASE_URL = var.telegram_api_base_url
     },
     var.rutracker_cookie == "" ? {} : {
       RUTRACKER_COOKIE = var.rutracker_cookie

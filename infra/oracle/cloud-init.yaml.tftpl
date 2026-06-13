@@ -1,0 +1,176 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - clang
+  - cmake
+  - curl
+  - g++
+  - gcc
+  - git
+  - gperf
+  - libssl-dev
+  - make
+  - pkg-config
+  - zlib1g-dev
+
+write_files:
+  - path: /etc/telegram-rutracker-bot.env
+    owner: root:root
+    permissions: "0600"
+    content: |
+      TELEGRAM_BOT_TOKEN=${telegram_bot_token}
+      TELEGRAM_WEBHOOK_SECRET=${telegram_webhook_secret}
+      TELEGRAM_API_BASE_URL="http://127.0.0.1:8081"
+      VM_WORKER_SECRET=${vm_worker_secret}
+      VM_WORKER_BIND="0.0.0.0:8080"
+      ALLOWED_TELEGRAM_USER_IDS=${allowed_telegram_user_ids}
+      RUTRACKER_BASE_URLS=${rutracker_base_urls}
+      RUTRACKER_USERNAME=${rutracker_username}
+      RUTRACKER_PASSWORD=${rutracker_password}
+      RUTRACKER_COOKIE=${rutracker_cookie}
+      MAX_FILE_MB=${max_file_mb}
+      LAMBDA_TIMEOUT_SECONDS=${download_timeout_seconds}
+      DOWNLOAD_MARGIN_SECONDS=${download_margin_seconds}
+      DOWNLOAD_COUNTDOWN_LABEL="Download time budget"
+      DOWNLOAD_STATUS_INTERVAL_SECONDS="3600"
+      TORRENT_PEER_LIMIT=${torrent_peer_limit}
+      SEED_TORRENTS="true"
+      TORRENT_LISTEN_PORT=${torrent_listen_port}
+      SEED_DISK_RESERVE_MB=${seed_disk_reserve_mb}
+      TMP_DIR="/var/lib/telegram-rutracker-bot/tmp"
+      RUST_LOG="info"
+  - path: /usr/local/sbin/open-telegram-rutracker-worker-port.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env sh
+      set -eu
+      iptables -C INPUT -p tcp -m tcp --dport 8080 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 8080 -j ACCEPT
+      iptables -C INPUT -p tcp -m tcp --dport ${torrent_listen_port} -j ACCEPT 2>/dev/null || iptables -I INPUT 6 -p tcp -m tcp --dport ${torrent_listen_port} -j ACCEPT
+      iptables -C INPUT -p udp -m udp --dport ${torrent_listen_port} -j ACCEPT 2>/dev/null || iptables -I INPUT 7 -p udp -m udp --dport ${torrent_listen_port} -j ACCEPT
+  - path: /etc/systemd/system/telegram-bot-api.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Local Telegram Bot API server
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=telegrambot
+      Group=telegrambot
+      ExecStart=/opt/telegram-rutracker/bin/telegram-bot-api --api-id=${telegram_api_id} --api-hash=${telegram_api_hash} --local --http-ip-address=127.0.0.1 --http-port=8081 --dir=/var/lib/telegram-bot-api --temp-dir=/var/lib/telegram-bot-api/tmp
+      Restart=always
+      RestartSec=5
+      LimitNOFILE=1048576
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/telegram-rutracker-firewall.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Open Telegram RuTracker VM worker port
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/open-telegram-rutracker-worker-port.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/telegram-rutracker-vm-worker.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Telegram RuTracker VM worker
+      After=network-online.target telegram-rutracker-firewall.service telegram-bot-api.service
+      Wants=network-online.target telegram-rutracker-firewall.service telegram-bot-api.service
+
+      [Service]
+      User=telegrambot
+      Group=telegrambot
+      WorkingDirectory=/var/lib/telegram-rutracker-bot
+      EnvironmentFile=/etc/telegram-rutracker-bot.env
+      ExecStart=/opt/telegram-rutracker/bin/telegram-rutracker-vm-worker
+      Restart=always
+      RestartSec=5
+      LimitNOFILE=1048576
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/telegram-rutracker-poller.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Telegram RuTracker bot poller
+      After=network-online.target telegram-bot-api.service
+      Wants=network-online.target telegram-bot-api.service
+
+      [Service]
+      User=telegrambot
+      Group=telegrambot
+      WorkingDirectory=/var/lib/telegram-rutracker-bot
+      EnvironmentFile=/etc/telegram-rutracker-bot.env
+      ExecStart=/opt/telegram-rutracker/bin/telegram-rutracker-poller
+      Restart=always
+      RestartSec=5
+      LimitNOFILE=1048576
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/sbin/install-telegram-rutracker-bot.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export HOME=/root
+
+      install -d -m 0755 /opt/telegram-rutracker/src /opt/telegram-rutracker/bin
+      if ! id -u telegrambot >/dev/null 2>&1; then
+        useradd --system --create-home --home-dir /var/lib/telegram-rutracker-bot --shell /usr/sbin/nologin telegrambot
+      fi
+      install -d -m 0755 -o telegrambot -g telegrambot /var/lib/telegram-bot-api /var/lib/telegram-bot-api/tmp /var/lib/telegram-rutracker-bot /var/lib/telegram-rutracker-bot/tmp
+      iptables -C INPUT -p tcp -m tcp --dport 8080 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 8080 -j ACCEPT
+
+      if ! command -v cargo >/dev/null 2>&1; then
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+      fi
+      . /root/.cargo/env
+
+      if [ ! -d /opt/telegram-rutracker/src/telegram-bot-api/.git ]; then
+        git clone --recursive https://github.com/tdlib/telegram-bot-api.git /opt/telegram-rutracker/src/telegram-bot-api
+      fi
+      cd /opt/telegram-rutracker/src/telegram-bot-api
+      git pull --ff-only
+      git submodule update --init --recursive
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      cmake --build build --target telegram-bot-api --parallel "$(nproc)"
+      install -m 0755 build/telegram-bot-api /opt/telegram-rutracker/bin/telegram-bot-api
+
+      if [ ! -d /opt/telegram-rutracker/src/bot/.git ]; then
+        git clone ${bot_repo_url} /opt/telegram-rutracker/src/bot
+      fi
+      cd /opt/telegram-rutracker/src/bot
+      git fetch --all --tags
+      git checkout ${bot_repo_ref}
+      git pull --ff-only || true
+      RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release --bin telegram-rutracker-vm-worker --bin telegram-rutracker-poller
+      install -m 0755 target/release/telegram-rutracker-vm-worker /opt/telegram-rutracker/bin/telegram-rutracker-vm-worker
+      install -m 0755 target/release/telegram-rutracker-poller /opt/telegram-rutracker/bin/telegram-rutracker-poller
+
+      systemctl daemon-reload
+      systemctl enable --now telegram-rutracker-firewall.service
+      systemctl enable --now telegram-bot-api.service
+      systemctl enable --now telegram-rutracker-vm-worker.service
+
+runcmd:
+  - /usr/local/sbin/install-telegram-rutracker-bot.sh

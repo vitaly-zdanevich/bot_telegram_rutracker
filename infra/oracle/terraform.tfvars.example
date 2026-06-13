@@ -1,0 +1,23 @@
+oci_region           = "eu-stockholm-1"
+oci_tenancy_ocid     = "ocid1.tenancy.oc1..replace"
+oci_user_ocid        = "ocid1.user.oc1..replace"
+oci_fingerprint      = "replace"
+oci_private_key_path = "~/.oci/oci_api_key.pem"
+oci_compartment_ocid = "ocid1.compartment.oc1..replace"
+ssh_public_key       = "ssh-ed25519 replace"
+ssh_ingress_cidr     = "0.0.0.0/0"
+vm_worker_ingress_cidr = "0.0.0.0/0"
+torrent_ingress_cidr = "0.0.0.0/0"
+torrent_listen_port  = 49152
+seed_disk_reserve_mb = 0
+
+# Use an ARM-compatible Oracle image OCID for the selected region.
+oracle_image_ocid = "ocid1.image.oc1..replace"
+
+telegram_bot_token = "123456:replace-me"
+telegram_api_id    = 123456
+telegram_api_hash  = "replace"
+vm_worker_secret   = "replace-with-random-secret"
+
+allowed_telegram_user_ids = ""
+rutracker_base_urls       = "https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum"

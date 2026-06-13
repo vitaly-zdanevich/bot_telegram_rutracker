@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -14,6 +15,12 @@ use tracing::warn;
 // Telegram documents message text as 1-4096 characters after entity parsing.
 // https://core.telegram.org/bots/api#editmessagetext
 pub const TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS: usize = 4096;
+// Telegram captions are limited to 0-1024 characters after entity parsing.
+// https://core.telegram.org/bots/api#sendphoto
+pub const TELEGRAM_CAPTION_LIMIT_CHARS: usize = 1024;
+// Telegram Bot API documents sendPhoto uploads as limited to 10 MB.
+// https://core.telegram.org/bots/api#sendphoto
+const TELEGRAM_PHOTO_UPLOAD_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct Update {
@@ -67,6 +74,7 @@ pub struct ProgressMessage {
 #[derive(Clone)]
 pub struct Telegram {
     token: String,
+    api_base_url: String,
     http: reqwest::Client,
 }
 
@@ -107,9 +115,10 @@ impl StatusCountdown {
 }
 
 impl Telegram {
-    pub fn new(token: String) -> Self {
+    pub fn new(token: String, api_base_url: String) -> Self {
         Self {
             token,
+            api_base_url,
             http: reqwest::Client::new(),
         }
     }
@@ -125,6 +134,23 @@ impl Telegram {
             .map(|_| ())
     }
 
+    /// Sends a message as a Telegram reply to an existing message, keeping
+    /// secondary content visually grouped with the result it belongs to.
+    pub async fn send_message_reply_to(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<()> {
+        let mut payload = self.send_message_payload(chat_id, text, reply_markup, Some("HTML"));
+        payload["reply_to_message_id"] = json!(reply_to_message_id);
+        payload["allow_sending_without_reply"] = json!(true);
+        self.telegram_json_value("sendMessage", payload)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn send_message_value(
         &self,
         chat_id: i64,
@@ -132,6 +158,19 @@ impl Telegram {
         reply_markup: Option<Value>,
         parse_mode: Option<&str>,
     ) -> Result<Value> {
+        let payload = self.send_message_payload(chat_id, text, reply_markup, parse_mode);
+        self.telegram_json_value("sendMessage", payload).await
+    }
+
+    /// Builds the shared sendMessage JSON payload so normal messages and
+    /// reply messages keep identical parsing, previews, and truncation.
+    fn send_message_payload(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<Value>,
+        parse_mode: Option<&str>,
+    ) -> Value {
         let mut payload = json!({
             "chat_id": chat_id,
             "text": truncate_for_telegram(text, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS),
@@ -143,7 +182,7 @@ impl Telegram {
         if let Some(parse_mode) = parse_mode {
             payload["parse_mode"] = json!(parse_mode);
         }
-        self.telegram_json_value("sendMessage", payload).await
+        payload
     }
 
     pub async fn send_status_message(&self, chat_id: i64, text: &str) -> Result<ProgressMessage> {
@@ -178,6 +217,23 @@ impl Telegram {
             payload["reply_markup"] = markup;
         }
         self.telegram_json_value("editMessageText", payload)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn edit_message_reply_markup(
+        &self,
+        progress: ProgressMessage,
+        reply_markup: Option<Value>,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "chat_id": progress.chat_id,
+            "message_id": progress.message_id,
+        });
+        if let Some(markup) = reply_markup {
+            payload["reply_markup"] = markup;
+        }
+        self.telegram_json_value("editMessageReplyMarkup", payload)
             .await
             .map(|_| ())
     }
@@ -236,6 +292,37 @@ impl Telegram {
         .map(|_| ())
     }
 
+    pub async fn delete_webhook(&self) -> Result<()> {
+        self.telegram_json_value(
+            "deleteWebhook",
+            json!({
+                "drop_pending_updates": false,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn get_updates(
+        &self,
+        offset: Option<i64>,
+        timeout_seconds: u64,
+    ) -> Result<Vec<Update>> {
+        let mut payload = json!({
+            "timeout": timeout_seconds,
+            "allowed_updates": ["message", "callback_query", "inline_query"],
+        });
+        if let Some(offset) = offset {
+            payload["offset"] = json!(offset);
+        }
+        let value = self.telegram_json_value("getUpdates", payload).await?;
+        let result = value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("Telegram getUpdates response has no result"))?;
+        serde_json::from_value(result).context("failed to parse Telegram updates")
+    }
+
     pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
         self.telegram_json_value(
             "sendChatAction",
@@ -269,6 +356,8 @@ impl Telegram {
         &self,
         progress: ProgressMessage,
         prefix: &'static str,
+        label: String,
+        update_interval_seconds: u64,
         total_seconds: u64,
     ) -> StatusCountdown {
         let stop = Arc::new(AtomicBool::new(false));
@@ -276,14 +365,16 @@ impl Telegram {
         let telegram = self.clone();
         let started_at = Instant::now();
         let task = tokio::spawn(async move {
-            let mut last_minutes = u64::MAX;
+            let update_interval_seconds = update_interval_seconds.max(1);
+            let mut last_update_bucket = u64::MAX;
             while !task_stop.load(Ordering::Relaxed) {
                 let elapsed = started_at.elapsed().as_secs();
                 let remaining = total_seconds.saturating_sub(elapsed);
                 let minutes = remaining.div_ceil(60);
-                if minutes != last_minutes {
-                    last_minutes = minutes;
-                    let text = countdown_status_text(prefix, minutes.max(1));
+                let update_bucket = elapsed / update_interval_seconds;
+                if update_bucket != last_update_bucket {
+                    last_update_bucket = update_bucket;
+                    let text = countdown_status_text(prefix, &label, minutes.max(1));
                     telegram.try_edit_message(progress, &text).await;
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -314,14 +405,27 @@ impl Telegram {
                 .mime_str(mime)?,
         );
         if let Some(caption) = caption {
-            form = form.text("caption", truncate_for_telegram(caption, 1024));
+            form = form
+                .text(
+                    "caption",
+                    truncate_for_telegram(caption, TELEGRAM_CAPTION_LIMIT_CHARS),
+                )
+                .text("parse_mode", "HTML");
         }
-        self.http
+        let response = self
+            .http
             .post(self.method_url("sendDocument"))
             .multipart(form)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "Telegram sendDocument request failed: {}",
+                    err.without_url()
+                )
+            })?;
+        self.telegram_status_response("sendDocument", response)
+            .await?;
         Ok(())
     }
 
@@ -337,7 +441,8 @@ impl Telegram {
             "photo": photo_url,
         });
         if let Some(caption) = caption {
-            payload["caption"] = json!(truncate_for_telegram(caption, 1024));
+            payload["caption"] =
+                json!(truncate_for_telegram(caption, TELEGRAM_CAPTION_LIMIT_CHARS));
             payload["parse_mode"] = json!("HTML");
         }
         if let Some(markup) = reply_markup {
@@ -348,14 +453,115 @@ impl Telegram {
             .map(|_| ())
     }
 
+    /// Sends a photo by URL, falling back to multipart upload when Telegram
+    /// cannot fetch the remote URL itself.
+    ///
+    /// This matters for RuTracker first-post images: some hosts are reachable
+    /// from the VM but rejected by Telegram/local Bot API as remote URLs.
+    pub async fn send_photo_url_or_upload(
+        &self,
+        chat_id: i64,
+        photo_url: &str,
+        caption: Option<&str>,
+        reply_markup: Option<Value>,
+    ) -> Result<()> {
+        let url_error = match self
+            .send_photo_url(chat_id, photo_url, caption, reply_markup.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        self.send_photo_upload_from_url(chat_id, photo_url, caption, reply_markup)
+            .await
+            .with_context(|| {
+                format!("Telegram rejected image URL ({url_error}); upload fallback failed")
+            })
+    }
+
+    async fn send_photo_upload_from_url(
+        &self,
+        chat_id: i64,
+        photo_url: &str,
+        caption: Option<&str>,
+        reply_markup: Option<Value>,
+    ) -> Result<()> {
+        // Download through the bot process, then upload as InputFile. This keeps
+        // search result images working even when sendPhoto rejects the URL form.
+        let response = self
+            .http
+            .get(photo_url)
+            .send()
+            .await
+            .map_err(|err| anyhow!("failed to download image URL: {}", err.without_url()))?;
+        let response = self
+            .http_status_response("image download", response)
+            .await?;
+        if let Some(length) = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            && length > TELEGRAM_PHOTO_UPLOAD_MAX_BYTES
+        {
+            bail!("image is too large for sendPhoto: {length} bytes");
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| anyhow!("failed to read image bytes: {}", err.without_url()))?;
+        if bytes.len() as u64 > TELEGRAM_PHOTO_UPLOAD_MAX_BYTES {
+            bail!("image is too large for sendPhoto: {} bytes", bytes.len());
+        }
+        let file_name = remote_file_name(photo_url);
+        let mime = image_mime_for_upload(content_type.as_deref(), &file_name)?;
+        let mut form = Form::new().text("chat_id", chat_id.to_string()).part(
+            "photo",
+            Part::bytes(bytes.to_vec())
+                .file_name(file_name)
+                .mime_str(&mime)?,
+        );
+        if let Some(caption) = caption {
+            form = form
+                .text(
+                    "caption",
+                    truncate_for_telegram(caption, TELEGRAM_CAPTION_LIMIT_CHARS),
+                )
+                .text("parse_mode", "HTML");
+        }
+        if let Some(markup) = reply_markup {
+            form = form.text("reply_markup", serde_json::to_string(&markup)?);
+        }
+        let response = self
+            .http
+            .post(self.method_url("sendPhoto"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "Telegram sendPhoto upload request failed: {}",
+                    err.without_url()
+                )
+            })?;
+        self.telegram_status_response("sendPhoto", response).await?;
+        Ok(())
+    }
+
     async fn telegram_json_value(&self, method: &str, payload: Value) -> Result<Value> {
         let response = self
             .http
             .post(self.method_url(method))
             .json(&payload)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|err| anyhow!("Telegram {method} request failed: {}", err.without_url()))?;
+        let response = self.telegram_status_response(method, response).await?;
         let value = response.json::<Value>().await?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(anyhow!("Telegram {method} returned {value}"));
@@ -363,8 +569,40 @@ impl Telegram {
         Ok(value)
     }
 
+    async fn telegram_status_response(
+        &self,
+        method: &str,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response> {
+        self.status_response(&format!("Telegram {method}"), response)
+            .await
+    }
+
+    async fn http_status_response(
+        &self,
+        label: &str,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response> {
+        self.status_response(label, response).await
+    }
+
+    async fn status_response(
+        &self,
+        label: &str,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response> {
+        // Do not use reqwest::error_for_status here: its error includes the
+        // full request URL, which contains the Telegram bot token.
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        bail!("{label} returned HTTP {status}: {body}")
+    }
+
     fn method_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.api_base_url, self.token)
     }
 }
 
@@ -384,11 +622,65 @@ pub fn truncate_for_telegram(value: &str, limit: usize) -> String {
     truncated
 }
 
-pub fn countdown_status_text(prefix: &str, minutes_left: u64) -> String {
+fn remote_file_name(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back().map(str::to_string))
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "photo.jpg".to_string())
+}
+
+fn image_mime_for_upload(content_type: Option<&str>, file_name: &str) -> Result<String> {
+    if let Some(content_type) = content_type.and_then(|value| value.split(';').next()) {
+        let content_type = content_type.trim();
+        if content_type.starts_with("image/") {
+            return Ok(content_type.to_string());
+        }
+        if content_type == "application/octet-stream"
+            && let Some(mime) = mime_guess::from_path(file_name).first_raw()
+            && mime.starts_with("image/")
+        {
+            return Ok(mime.to_string());
+        }
+        bail!("downloaded URL is not an image: {content_type}");
+    }
+    mime_guess::from_path(file_name)
+        .first_raw()
+        .filter(|mime| mime.starts_with("image/"))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("downloaded URL has no image content type"))
+}
+
+pub fn countdown_status_text(prefix: &str, label: &str, minutes_left: u64) -> String {
     format!(
-        "{prefix}\nAWS Lambda lifetime: {} minutes left",
-        minutes_left.max(1)
+        "{prefix}\n{label}: {} left",
+        format_minutes_left(minutes_left.max(1))
     )
+}
+
+fn format_minutes_left(minutes_left: u64) -> String {
+    let hours = minutes_left / 60;
+    let minutes = minutes_left % 60;
+    match (hours, minutes) {
+        (0, minutes) => pluralize(minutes, "minute"),
+        (hours, 0) => pluralize(hours, "hour"),
+        (hours, minutes) => format!(
+            "{} {}",
+            pluralize(hours, "hour"),
+            pluralize(minutes, "minute")
+        ),
+    }
+}
+
+fn pluralize(value: u64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
 }
 
 pub fn inline_keyboard(rows: Vec<Vec<Value>>) -> Value {
@@ -420,13 +712,38 @@ pub fn copy_button(text: &str, copy_text: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::countdown_status_text;
+    use super::{Telegram, countdown_status_text};
 
     #[test]
     fn formats_countdown_with_lambda_lifetime() {
         assert_eq!(
-            countdown_status_text("Downloading selected files...", 15),
+            countdown_status_text("Downloading selected files...", "AWS Lambda lifetime", 15),
             "Downloading selected files...\nAWS Lambda lifetime: 15 minutes left"
+        );
+    }
+
+    #[test]
+    fn formats_countdown_with_custom_label() {
+        assert_eq!(
+            countdown_status_text("Downloading selected files...", "Download time budget", 60),
+            "Downloading selected files...\nDownload time budget: 1 hour left"
+        );
+        assert_eq!(
+            countdown_status_text(
+                "Downloading selected files...",
+                "Download time budget",
+                1439
+            ),
+            "Downloading selected files...\nDownload time budget: 23 hours 59 minutes left"
+        );
+    }
+
+    #[test]
+    fn builds_method_url_from_configured_api_base_url() {
+        let telegram = Telegram::new("token".to_string(), "http://127.0.0.1:8081".to_string());
+        assert_eq!(
+            telegram.method_url("sendDocument"),
+            "http://127.0.0.1:8081/bottoken/sendDocument"
         );
     }
 }
