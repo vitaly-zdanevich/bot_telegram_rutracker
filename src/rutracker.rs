@@ -1315,6 +1315,33 @@ fn topic_description_body(post: ElementRef<'_>) -> Option<ElementRef<'_>> {
 fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
+    // RuTracker topics often use right-aligned post images as covers. Prefer
+    // those for the topic card, while keeping the remaining images available.
+    for image in body.select(&selector("var.postImg.img-right[title]")) {
+        let Some(src) = image.value().attr("title") else {
+            continue;
+        };
+        let Some(url) = attr_url(base_url, src) else {
+            continue;
+        };
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
+    for img in body.select(&selector("img.img-right")) {
+        let Some(src) = img.value().attr("src") else {
+            continue;
+        };
+        let Some(url) = attr_url(base_url, src) else {
+            continue;
+        };
+        if is_rutracker_ui_image(&url) {
+            continue;
+        }
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
     // RuTracker renders some BBCode images as a var.postImg element whose
     // title contains the real image URL instead of using <img src=...>.
     for image in body.select(&selector("var.postImg[title]")) {
@@ -2135,6 +2162,30 @@ mod tests {
         );
         assert_eq!(topic.comments_page, 1);
         assert_eq!(topic.comments_total_pages, 6);
+    }
+
+    #[test]
+    fn prefers_right_aligned_first_post_image() {
+        let html = r#"
+            <div class="post_body">
+                <a href="https://example.invalid/wiki">
+                    <var class="postImg" title="https://img.example/wiki-icon.png"></var>
+                </a>
+                <var class="postImg postImgAligned img-right" title="https://img.example/cover.png"></var>
+                <img src="/images/back.jpg" alt="">
+            </div>
+        "#;
+        let doc = Html::parse_fragment(html);
+        let body = doc.select(&selector(".post_body")).next().unwrap();
+
+        assert_eq!(
+            image_urls(body, &base()),
+            vec![
+                "https://img.example/cover.png",
+                "https://img.example/wiki-icon.png",
+                "https://rutracker.org/images/back.jpg",
+            ]
+        );
     }
 
     #[test]
