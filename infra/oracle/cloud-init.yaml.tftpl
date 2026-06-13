@@ -152,7 +152,7 @@ write_files:
       cd /opt/telegram-rutracker/src/telegram-bot-api
       git pull --ff-only
       git submodule update --init --recursive
-      cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=neoverse-n1" -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=neoverse-n1"
       cmake --build build --target telegram-bot-api --parallel "$(nproc)"
       install -m 0755 build/telegram-bot-api /opt/telegram-rutracker/bin/telegram-bot-api
 

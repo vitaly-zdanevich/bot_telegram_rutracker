@@ -84,7 +84,7 @@ variable "oracle_image_operating_system" {
 variable "oracle_image_operating_system_version" {
   description = "Operating system version used when oracle_image_ocid is empty."
   type        = string
-  default     = "22.04"
+  default     = "24.04"
 }
 
 variable "oracle_shape" {

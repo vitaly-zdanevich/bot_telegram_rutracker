@@ -11,8 +11,8 @@ torrent_ingress_cidr = "0.0.0.0/0"
 torrent_listen_port  = 49152
 seed_disk_reserve_mb = 0
 
-# Use an ARM-compatible Oracle image OCID for the selected region.
-oracle_image_ocid = "ocid1.image.oc1..replace"
+# Leave empty to auto-select the latest matching Ubuntu ARM image.
+oracle_image_ocid = ""
 
 telegram_bot_token = "123456:replace-me"
 telegram_api_id    = 123456
