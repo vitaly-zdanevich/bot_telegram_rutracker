@@ -103,6 +103,20 @@ build/oracle/telegram-rutracker-vm-worker
 build/oracle/telegram-rutracker-poller
 ```
 
+## Local Checks
+
+Run the same checks as CI:
+
+```bash
+./scripts/check.sh
+```
+
+Enable the tracked pre-commit hook for this clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Deploy
 
 Lambda:

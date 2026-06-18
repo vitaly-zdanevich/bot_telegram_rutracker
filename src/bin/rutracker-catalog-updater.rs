@@ -131,10 +131,10 @@ async fn main() -> Result<()> {
         forums = stats.forums,
         "rebuilt local RuTracker catalog"
     );
-    if optional_env("RUTRACKER_CATALOG_KEEP_DOWNLOAD").as_deref() != Some("1") {
-        if let Err(err) = tokio::fs::remove_dir_all(&download_dir).await {
-            warn!(error = %err, path = %download_dir.display(), "failed to remove catalog download directory");
-        }
+    if optional_env("RUTRACKER_CATALOG_KEEP_DOWNLOAD").as_deref() != Some("1")
+        && let Err(err) = tokio::fs::remove_dir_all(&download_dir).await
+    {
+        warn!(error = %err, path = %download_dir.display(), "failed to remove catalog download directory");
     }
     Ok(())
 }
@@ -151,10 +151,10 @@ fn catalog_source_matches(
     if let (Some(existing_date), Some(current_date)) = (
         existing.topic_date.as_deref().map(str::trim),
         current.topic_date.as_deref().map(str::trim),
-    ) {
-        if !existing_date.is_empty() && existing_date == current_date {
-            return true;
-        }
+    ) && !existing_date.is_empty()
+        && existing_date == current_date
+    {
+        return true;
     }
     false
 }
