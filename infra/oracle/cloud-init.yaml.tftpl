@@ -10,8 +10,10 @@ packages:
   - git
   - gperf
   - libssl-dev
+  - liblzma-dev
   - make
   - pkg-config
+  - xz-utils
   - zlib1g-dev
 
 write_files:
@@ -38,6 +40,10 @@ write_files:
       SEED_TORRENTS="true"
       TORRENT_LISTEN_PORT=${torrent_listen_port}
       SEED_DISK_RESERVE_MB=${seed_disk_reserve_mb}
+      RUTRACKER_CATALOG_ENABLED=${rutracker_catalog_enabled}
+      RUTRACKER_CATALOG_PATH=${rutracker_catalog_path}
+      RUTRACKER_CATALOG_XML_TOPIC_ID=${rutracker_catalog_xml_topic_id}
+      RUTRACKER_CATALOG_DOWNLOAD_TIMEOUT_SECONDS=${rutracker_catalog_download_timeout_seconds}
       TMP_DIR="/var/lib/telegram-rutracker-bot/tmp"
       RUST_LOG="info"
   - path: /usr/local/sbin/open-telegram-rutracker-worker-port.sh
@@ -126,6 +132,44 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
+  - path: /etc/systemd/system/rutracker-catalog-updater.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Update local RuTracker XML catalog fallback
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      User=telegrambot
+      Group=telegrambot
+      WorkingDirectory=/var/lib/telegram-rutracker-bot
+      EnvironmentFile=/etc/telegram-rutracker-bot.env
+      ExecStart=/opt/telegram-rutracker/bin/rutracker-catalog-updater
+      Nice=10
+      IOSchedulingClass=best-effort
+      IOSchedulingPriority=7
+      TimeoutStartSec=infinity
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/rutracker-catalog-updater.timer
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Monthly local RuTracker XML catalog update
+
+      [Timer]
+      OnCalendar=monthly
+      Persistent=true
+      RandomizedDelaySec=6h
+      Unit=rutracker-catalog-updater.service
+
+      [Install]
+      WantedBy=timers.target
   - path: /usr/local/sbin/install-telegram-rutracker-bot.sh
     owner: root:root
     permissions: "0755"
@@ -163,14 +207,17 @@ write_files:
       git fetch --all --tags
       git checkout ${bot_repo_ref}
       git pull --ff-only || true
-      RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release --bin telegram-rutracker-vm-worker --bin telegram-rutracker-poller
+      RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release --bin telegram-rutracker-vm-worker --bin telegram-rutracker-poller --bin rutracker-catalog-updater
       install -m 0755 target/release/telegram-rutracker-vm-worker /opt/telegram-rutracker/bin/telegram-rutracker-vm-worker
       install -m 0755 target/release/telegram-rutracker-poller /opt/telegram-rutracker/bin/telegram-rutracker-poller
+      install -m 0755 target/release/rutracker-catalog-updater /opt/telegram-rutracker/bin/rutracker-catalog-updater
 
       systemctl daemon-reload
       systemctl enable --now telegram-rutracker-firewall.service
       systemctl enable --now telegram-bot-api.service
       systemctl enable --now telegram-rutracker-vm-worker.service
+      systemctl enable --now rutracker-catalog-updater.timer
+      systemctl start --no-block rutracker-catalog-updater.service || true
 
 runcmd:
   - /usr/local/sbin/install-telegram-rutracker-bot.sh

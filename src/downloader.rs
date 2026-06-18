@@ -78,6 +78,7 @@ struct SeedSessionKey {
 
 static SEED_SESSIONS: OnceLock<Mutex<HashMap<SeedSessionKey, Arc<Session>>>> = OnceLock::new();
 static SEED_DOWNLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const MAGNET_METADATA_MAX_ATTEMPTS: usize = 5;
 
 impl TorrentDownloader {
     pub fn new(output_dir: PathBuf, peer_limit: usize) -> Self {
@@ -145,25 +146,37 @@ impl TorrentDownloader {
         timeout_seconds: u64,
     ) -> Result<TorrentMetadata> {
         let session = self.session().await?;
-        let response = timeout(
-            Duration::from_secs(timeout_seconds),
-            session.add_torrent(
-                AddTorrent::from_url(magnet),
-                Some(AddTorrentOptions {
-                    list_only: true,
-                    peer_limit: Some(self.peer_limit),
-                    ..Default::default()
-                }),
-            ),
-        )
-        .await
-        .context("timed out while resolving magnet metadata")?
-        .context("failed to resolve magnet metadata")?;
-
-        let AddTorrentResponse::ListOnly(list) = response else {
-            bail!("magnet metadata request did not return list-only response");
-        };
-        Ok(metadata_from_list_only(list))
+        let mut last_error = None;
+        for attempt in 1..=MAGNET_METADATA_MAX_ATTEMPTS {
+            match resolve_magnet_metadata_once(&session, magnet, timeout_seconds, self.peer_limit)
+                .await
+            {
+                Ok(metadata) => {
+                    if attempt > 1 {
+                        info!(
+                            attempt,
+                            max_attempts = MAGNET_METADATA_MAX_ATTEMPTS,
+                            "magnet metadata resolution succeeded after retry"
+                        );
+                    }
+                    return Ok(metadata);
+                }
+                Err(err) => {
+                    warn!(
+                        attempt,
+                        max_attempts = MAGNET_METADATA_MAX_ATTEMPTS,
+                        error = %err,
+                        "magnet metadata resolution attempt failed"
+                    );
+                    last_error = Some(err);
+                    if attempt < MAGNET_METADATA_MAX_ATTEMPTS {
+                        sleep(magnet_metadata_retry_delay(attempt)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("magnet metadata resolution was not attempted")))
+            .context("failed to resolve magnet metadata after 5 attempts")
     }
 
     pub async fn download_small_files<F, Fut>(
@@ -262,6 +275,50 @@ impl TorrentDownloader {
             timed_out,
             total_files,
         })
+    }
+
+    /// Downloads every file from a magnet into this downloader's output
+    /// directory. The catalog updater uses this for the RuTracker XML dump,
+    /// which is intentionally much larger than Telegram's per-file upload path.
+    pub async fn download_all_files(&self, magnet: &str, timeout_seconds: u64) -> Result<()> {
+        tokio::fs::create_dir_all(&self.output_dir)
+            .await
+            .context("failed to create torrent output directory")?;
+        let session = self.session().await?;
+        let add_response = session
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(self.output_dir.to_string_lossy().into_owned()),
+                    peer_limit: Some(self.peer_limit),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("failed to add torrent")?;
+        let Some(handle) = add_response.into_handle() else {
+            bail!("torrent was not added to downloader");
+        };
+
+        let started_at = Instant::now();
+        let hard_timeout = Duration::from_secs(timeout_seconds);
+        loop {
+            if started_at.elapsed() >= hard_timeout {
+                bail!("timed out while downloading torrent");
+            }
+            let stats = handle.stats();
+            ensure_torrent_has_no_error(&stats)?;
+            if stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes {
+                info!(
+                    elapsed_seconds = started_at.elapsed().as_secs(),
+                    total_bytes = stats.total_bytes,
+                    "whole torrent download finished"
+                );
+                return Ok(());
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
     }
 
     async fn prepare_output_dir(&self, selected_files: &[TorrentFile]) -> Result<()> {
@@ -569,6 +626,37 @@ where
     Ok(())
 }
 
+async fn resolve_magnet_metadata_once(
+    session: &Arc<Session>,
+    magnet: &str,
+    timeout_seconds: u64,
+    peer_limit: usize,
+) -> Result<TorrentMetadata> {
+    let response = timeout(
+        Duration::from_secs(timeout_seconds),
+        session.add_torrent(
+            AddTorrent::from_url(magnet),
+            Some(AddTorrentOptions {
+                list_only: true,
+                peer_limit: Some(peer_limit),
+                ..Default::default()
+            }),
+        ),
+    )
+    .await
+    .context("timed out while resolving magnet metadata")?
+    .context("failed to resolve magnet metadata")?;
+
+    let AddTorrentResponse::ListOnly(list) = response else {
+        bail!("magnet metadata request did not return list-only response");
+    };
+    Ok(metadata_from_list_only(list))
+}
+
+fn magnet_metadata_retry_delay(attempt: usize) -> Duration {
+    Duration::from_secs(attempt.min(5) as u64)
+}
+
 fn metadata_from_list_only(list: ListOnlyResponse) -> TorrentMetadata {
     let files = list
         .info
@@ -611,7 +699,18 @@ pub fn torrent_bytes_as_add(bytes: Vec<u8>) -> AddTorrent<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::cleanup_stale_download_dirs;
+    use super::{
+        MAGNET_METADATA_MAX_ATTEMPTS, cleanup_stale_download_dirs, magnet_metadata_retry_delay,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn magnet_metadata_retry_policy_uses_five_attempts() {
+        assert_eq!(MAGNET_METADATA_MAX_ATTEMPTS, 5);
+        assert_eq!(magnet_metadata_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(magnet_metadata_retry_delay(5), Duration::from_secs(5));
+        assert_eq!(magnet_metadata_retry_delay(99), Duration::from_secs(5));
+    }
 
     #[tokio::test]
     async fn removes_stale_rutracker_download_dirs() {

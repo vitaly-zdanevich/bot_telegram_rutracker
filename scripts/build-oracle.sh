@@ -86,9 +86,10 @@ cargo build \
   --release \
   --target "$TARGET" \
   --bin telegram-rutracker-vm-worker \
-  --bin telegram-rutracker-poller
+  --bin telegram-rutracker-poller \
+  --bin rutracker-catalog-updater
 
-for bin_name in telegram-rutracker-vm-worker telegram-rutracker-poller; do
+for bin_name in telegram-rutracker-vm-worker telegram-rutracker-poller rutracker-catalog-updater; do
   cp "$CARGO_TARGET_DIR/$TARGET/release/$bin_name" "$OUTPUT_DIR/$bin_name"
   strip "$OUTPUT_DIR/$bin_name" 2>/dev/null || true
   echo "Wrote $OUTPUT_DIR/$bin_name"

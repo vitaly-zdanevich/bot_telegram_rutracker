@@ -239,3 +239,27 @@ variable "seed_disk_reserve_mb" {
   type        = number
   default     = 0
 }
+
+variable "rutracker_catalog_enabled" {
+  description = "Enable VM local RuTracker XML catalog fallback search."
+  type        = bool
+  default     = true
+}
+
+variable "rutracker_catalog_path" {
+  description = "SQLite path for the local RuTracker catalog index built from the XML dump."
+  type        = string
+  default     = "/var/lib/telegram-rutracker-bot/catalog/rutracker.sqlite"
+}
+
+variable "rutracker_catalog_xml_topic_id" {
+  description = "RuTracker topic ID for the current XML dump torrent."
+  type        = number
+  default     = 5591249
+}
+
+variable "rutracker_catalog_download_timeout_seconds" {
+  description = "Maximum time for the monthly catalog updater to download the XML dump torrent."
+  type        = number
+  default     = 43200
+}

@@ -4,12 +4,16 @@ oci_user_ocid        = "ocid1.user.oc1..replace"
 oci_fingerprint      = "replace"
 oci_private_key_path = "~/.oci/oci_api_key.pem"
 oci_compartment_ocid = "ocid1.compartment.oc1..replace"
-ssh_public_key       = "ssh-ed25519 replace"
-ssh_ingress_cidr     = "0.0.0.0/0"
-vm_worker_ingress_cidr = "0.0.0.0/0"
-torrent_ingress_cidr = "0.0.0.0/0"
-torrent_listen_port  = 49152
-seed_disk_reserve_mb = 0
+ssh_public_key                              = "ssh-ed25519 replace"
+ssh_ingress_cidr                            = "0.0.0.0/0"
+vm_worker_ingress_cidr                      = "0.0.0.0/0"
+torrent_ingress_cidr                        = "0.0.0.0/0"
+torrent_listen_port                         = 49152
+seed_disk_reserve_mb                        = 0
+rutracker_catalog_enabled                   = true
+rutracker_catalog_path                      = "/var/lib/telegram-rutracker-bot/catalog/rutracker.sqlite"
+rutracker_catalog_xml_topic_id              = 5591249
+rutracker_catalog_download_timeout_seconds = 43200
 
 # Leave empty to auto-select the latest matching Ubuntu ARM image.
 oracle_image_ocid = ""

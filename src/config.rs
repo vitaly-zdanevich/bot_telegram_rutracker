@@ -20,6 +20,10 @@ const DEFAULT_PEER_LIMIT: usize = 120;
 const DEFAULT_SEED_TORRENTS: bool = false;
 const DEFAULT_TORRENT_LISTEN_PORT: u16 = 49152;
 const DEFAULT_SEED_DISK_RESERVE_MB: u64 = 0;
+const DEFAULT_RUTRACKER_CATALOG_PATH: &str =
+    "/var/lib/telegram-rutracker-bot/catalog/rutracker.sqlite";
+const DEFAULT_RUTRACKER_CATALOG_XML_TOPIC_ID: u64 =
+    crate::catalog::DEFAULT_RUTRACKER_CATALOG_TOPIC_ID;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -44,6 +48,8 @@ pub struct Config {
     pub seed_torrents: bool,
     pub torrent_listen_port: u16,
     pub seed_disk_reserve_mb: u64,
+    pub rutracker_catalog_path: Option<PathBuf>,
+    pub rutracker_catalog_xml_topic_id: u64,
 }
 
 impl Config {
@@ -92,6 +98,17 @@ impl Config {
             seed_torrents: parse_env("SEED_TORRENTS", DEFAULT_SEED_TORRENTS)?,
             torrent_listen_port: parse_env("TORRENT_LISTEN_PORT", DEFAULT_TORRENT_LISTEN_PORT)?,
             seed_disk_reserve_mb: parse_env("SEED_DISK_RESERVE_MB", DEFAULT_SEED_DISK_RESERVE_MB)?,
+            rutracker_catalog_path: parse_optional_path_env(
+                "RUTRACKER_CATALOG_PATH",
+                optional_env("RUTRACKER_CATALOG_ENABLED")
+                    .and_then(|value| value.parse::<bool>().ok())
+                    .unwrap_or(false)
+                    .then_some(DEFAULT_RUTRACKER_CATALOG_PATH),
+            ),
+            rutracker_catalog_xml_topic_id: parse_env(
+                "RUTRACKER_CATALOG_XML_TOPIC_ID",
+                DEFAULT_RUTRACKER_CATALOG_XML_TOPIC_ID,
+            )?,
         })
     }
 
@@ -100,6 +117,12 @@ impl Config {
             .saturating_sub(self.download_margin_seconds)
             .max(1)
     }
+}
+
+fn parse_optional_path_env(key: &str, default: Option<&str>) -> Option<PathBuf> {
+    optional_env(key)
+        .or_else(|| default.map(str::to_string))
+        .map(PathBuf::from)
 }
 
 pub fn required_env(key: &str) -> Result<String> {

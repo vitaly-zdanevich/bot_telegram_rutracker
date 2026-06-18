@@ -53,6 +53,9 @@ pub struct SearchResult {
     pub downloads: u64,
     pub topic_url: String,
     pub category_url: Option<String>,
+    pub magnet: Option<String>,
+    pub published: Option<String>,
+    pub local_catalog: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -828,6 +831,9 @@ pub fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<SearchResu
             downloads: extract_download_count(row),
             topic_url,
             category_url,
+            magnet: None,
+            published: None,
+            local_catalog: false,
         });
     }
 
@@ -896,6 +902,9 @@ pub fn parse_viewforum_results(
             downloads: 0,
             topic_url,
             category_url: category_url.clone(),
+            magnet: None,
+            published: None,
+            local_catalog: false,
         });
     }
 
@@ -960,6 +969,13 @@ fn merge_search_result(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.category_url.is_none() {
         existing.category_url = incoming.category_url;
     }
+    if existing.magnet.is_none() {
+        existing.magnet = incoming.magnet;
+    }
+    if existing.published.is_none() {
+        existing.published = incoming.published;
+    }
+    existing.local_catalog |= incoming.local_catalog;
 }
 
 fn extract_topic_id(link: ElementRef<'_>) -> Option<u64> {

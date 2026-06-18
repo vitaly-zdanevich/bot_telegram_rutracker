@@ -16,19 +16,23 @@ locals {
   availability_domain = var.availability_domain != "" ? var.availability_domain : data.oci_identity_availability_domains.available.availability_domains[0].name
   oracle_image_ocid   = var.oracle_image_ocid != "" && var.oracle_image_ocid != "ocid1.image.oc1..replace" ? var.oracle_image_ocid : data.oci_core_images.ubuntu.images[0].id
   env = {
-    telegram_bot_token        = jsonencode(var.telegram_bot_token)
-    telegram_webhook_secret   = jsonencode(var.telegram_webhook_secret)
-    allowed_telegram_user_ids = jsonencode(var.allowed_telegram_user_ids)
-    rutracker_base_urls       = jsonencode(var.rutracker_base_urls)
-    rutracker_username        = jsonencode(var.rutracker_username)
-    rutracker_password        = jsonencode(var.rutracker_password)
-    rutracker_cookie          = jsonencode(var.rutracker_cookie)
-    max_file_mb               = jsonencode(tostring(var.max_file_mb))
-    download_timeout_seconds  = jsonencode(tostring(var.download_timeout_seconds))
-    download_margin_seconds   = jsonencode(tostring(var.download_margin_seconds))
-    torrent_peer_limit        = jsonencode(tostring(var.torrent_peer_limit))
-    torrent_listen_port       = jsonencode(tostring(var.torrent_listen_port))
-    seed_disk_reserve_mb      = jsonencode(tostring(var.seed_disk_reserve_mb))
+    telegram_bot_token                         = jsonencode(var.telegram_bot_token)
+    telegram_webhook_secret                    = jsonencode(var.telegram_webhook_secret)
+    allowed_telegram_user_ids                  = jsonencode(var.allowed_telegram_user_ids)
+    rutracker_base_urls                        = jsonencode(var.rutracker_base_urls)
+    rutracker_username                         = jsonencode(var.rutracker_username)
+    rutracker_password                         = jsonencode(var.rutracker_password)
+    rutracker_cookie                           = jsonencode(var.rutracker_cookie)
+    max_file_mb                                = jsonencode(tostring(var.max_file_mb))
+    download_timeout_seconds                   = jsonencode(tostring(var.download_timeout_seconds))
+    download_margin_seconds                    = jsonencode(tostring(var.download_margin_seconds))
+    torrent_peer_limit                         = jsonencode(tostring(var.torrent_peer_limit))
+    torrent_listen_port                        = jsonencode(tostring(var.torrent_listen_port))
+    seed_disk_reserve_mb                       = jsonencode(tostring(var.seed_disk_reserve_mb))
+    rutracker_catalog_enabled                  = jsonencode(tostring(var.rutracker_catalog_enabled))
+    rutracker_catalog_path                     = jsonencode(var.rutracker_catalog_path)
+    rutracker_catalog_xml_topic_id             = jsonencode(tostring(var.rutracker_catalog_xml_topic_id))
+    rutracker_catalog_download_timeout_seconds = jsonencode(tostring(var.rutracker_catalog_download_timeout_seconds))
   }
 }
 
@@ -141,25 +145,29 @@ resource "oci_core_instance" "bot" {
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
     user_data = base64encode(templatefile("${path.module}/cloud-init.yaml.tftpl", {
-      project_name              = var.project_name
-      telegram_api_id           = var.telegram_api_id
-      telegram_api_hash         = jsonencode(var.telegram_api_hash)
-      vm_worker_secret          = jsonencode(var.vm_worker_secret)
-      bot_repo_url              = jsonencode(var.bot_repo_url)
-      bot_repo_ref              = jsonencode(var.bot_repo_ref)
-      telegram_bot_token        = local.env.telegram_bot_token
-      telegram_webhook_secret   = local.env.telegram_webhook_secret
-      allowed_telegram_user_ids = local.env.allowed_telegram_user_ids
-      rutracker_base_urls       = local.env.rutracker_base_urls
-      rutracker_username        = local.env.rutracker_username
-      rutracker_password        = local.env.rutracker_password
-      rutracker_cookie          = local.env.rutracker_cookie
-      max_file_mb               = local.env.max_file_mb
-      download_timeout_seconds  = local.env.download_timeout_seconds
-      download_margin_seconds   = local.env.download_margin_seconds
-      torrent_peer_limit        = local.env.torrent_peer_limit
-      torrent_listen_port       = local.env.torrent_listen_port
-      seed_disk_reserve_mb      = local.env.seed_disk_reserve_mb
+      project_name                               = var.project_name
+      telegram_api_id                            = var.telegram_api_id
+      telegram_api_hash                          = jsonencode(var.telegram_api_hash)
+      vm_worker_secret                           = jsonencode(var.vm_worker_secret)
+      bot_repo_url                               = jsonencode(var.bot_repo_url)
+      bot_repo_ref                               = jsonencode(var.bot_repo_ref)
+      telegram_bot_token                         = local.env.telegram_bot_token
+      telegram_webhook_secret                    = local.env.telegram_webhook_secret
+      allowed_telegram_user_ids                  = local.env.allowed_telegram_user_ids
+      rutracker_base_urls                        = local.env.rutracker_base_urls
+      rutracker_username                         = local.env.rutracker_username
+      rutracker_password                         = local.env.rutracker_password
+      rutracker_cookie                           = local.env.rutracker_cookie
+      max_file_mb                                = local.env.max_file_mb
+      download_timeout_seconds                   = local.env.download_timeout_seconds
+      download_margin_seconds                    = local.env.download_margin_seconds
+      torrent_peer_limit                         = local.env.torrent_peer_limit
+      torrent_listen_port                        = local.env.torrent_listen_port
+      seed_disk_reserve_mb                       = local.env.seed_disk_reserve_mb
+      rutracker_catalog_enabled                  = local.env.rutracker_catalog_enabled
+      rutracker_catalog_path                     = local.env.rutracker_catalog_path
+      rutracker_catalog_xml_topic_id             = local.env.rutracker_catalog_xml_topic_id
+      rutracker_catalog_download_timeout_seconds = local.env.rutracker_catalog_download_timeout_seconds
     }))
   }
 

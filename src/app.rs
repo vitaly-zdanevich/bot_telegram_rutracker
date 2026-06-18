@@ -15,6 +15,7 @@ use sha2::{Digest as Sha256Digest, Sha256};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
+use crate::catalog::OfflineCatalog;
 use crate::config::Config;
 use crate::downloader::{
     DownloadOutcome, DownloadRequest, SeedConfig, SeedTorrentStats, TorrentDownloader,
@@ -61,6 +62,7 @@ static LATEST_CACHE: OnceLock<CacheStore<u64, Vec<SearchResult>>> = OnceLock::ne
 static VIEWFORUM_LATEST_CACHE: OnceLock<CacheStore<u64, Vec<SearchResult>>> = OnceLock::new();
 static METADATA_CACHE: OnceLock<CacheStore<u64, TorrentMetadata>> = OnceLock::new();
 static DOWNLOAD_SELECTION_CACHE: OnceLock<CacheStore<String, DownloadSelection>> = OnceLock::new();
+static LOCAL_RESULT_CACHE: OnceLock<CacheStore<u64, SearchResult>> = OnceLock::new();
 
 const RAM_CACHE_TTL_SECONDS: u64 = 30 * 60;
 const SELECTION_PAGE_SIZE: usize = 8;
@@ -397,6 +399,7 @@ struct App {
     config: Config,
     telegram: Telegram,
     rutracker: RutrackerClient,
+    offline_catalog: Option<OfflineCatalog>,
 }
 
 impl App {
@@ -421,10 +424,21 @@ impl App {
             config.http_timeout_seconds,
             config.http_max_attempts,
         )?;
+        let offline_catalog = config.rutracker_catalog_path.as_ref().map(|path| {
+            OfflineCatalog::new(
+                path.clone(),
+                config
+                    .rutracker_base_urls
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "https://rutracker.org/forum".to_string()),
+            )
+        });
         Ok(Self {
             config,
             telegram,
             rutracker,
+            offline_catalog,
         })
     }
 
@@ -698,7 +712,18 @@ impl App {
         };
         let mut inline_results = Vec::new();
         for result in results.into_iter().take(10) {
-            let details = self.cached_topic(result.topic_id).await.ok();
+            if result.local_catalog {
+                cache_set(
+                    LOCAL_RESULT_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+                    result.topic_id,
+                    result.clone(),
+                );
+            }
+            let details = if result.local_catalog {
+                None
+            } else {
+                self.cached_topic(result.topic_id).await.ok()
+            };
             inline_results.push(self.inline_article(query, &result, details.as_ref())?);
         }
         self.telegram
@@ -733,11 +758,7 @@ impl App {
             .map(|category| category.name.as_str())
             .unwrap_or("unknown");
         let category_line = match category_ref {
-            Some(category) => format!(
-                "<a href=\"{}\">{}</a>",
-                html_escape(&self.rutracker.category_url(category.id)?),
-                html_escape(&category.name)
-            ),
+            Some(category) => self.category_link(category, result.category_url.as_deref())?,
             None => "unknown".to_string(),
         };
         let author = details
@@ -747,6 +768,7 @@ impl App {
             .unwrap_or_else(|| "unknown".to_string());
         let metadata_lines = details
             .map(format_topic_metadata_lines)
+            .or_else(|| format_search_metadata_lines(result))
             .filter(|lines| !lines.is_empty())
             .map(|lines| format!("{lines}\n"))
             .unwrap_or_default();
@@ -760,7 +782,9 @@ impl App {
             seeds,
             downloads,
         );
-        let magnet = details.and_then(|details| details.magnet.as_deref());
+        let magnet = details
+            .and_then(|details| details.magnet.as_deref())
+            .or(result.magnet.as_deref());
         let mut buttons = vec![vec![url_button("RuTracker", &result.topic_url)]];
         if let Some(magnet) = magnet {
             buttons.push(vec![copy_button("Magnet", magnet)]);
@@ -813,17 +837,38 @@ impl App {
                 .await?;
             return Ok(());
         }
-        self.telegram.try_delete_message(progress).await;
+        if results.iter().any(|result| result.local_catalog) {
+            self.telegram
+                .edit_message(
+                    progress,
+                    "RuTracker is unavailable after retries; showing matches from the local XML catalog fallback. Comments and live topic details are not included.",
+                    None,
+                )
+                .await?;
+        } else {
+            self.telegram.try_delete_message(progress).await;
+        }
 
         for result in results {
-            let details = match self.cached_topic(result.topic_id).await {
-                Ok(details) => {
-                    ensure_same_topic(&result, &details);
-                    Some(details)
-                }
-                Err(err) => {
-                    warn!(topic_id = result.topic_id, error = %err, "failed to fetch topic details for search result");
-                    None
+            if result.local_catalog {
+                cache_set(
+                    LOCAL_RESULT_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+                    result.topic_id,
+                    result.clone(),
+                );
+            }
+            let details = if result.local_catalog {
+                None
+            } else {
+                match self.cached_topic(result.topic_id).await {
+                    Ok(details) => {
+                        ensure_same_topic(&result, &details);
+                        Some(details)
+                    }
+                    Err(err) => {
+                        warn!(topic_id = result.topic_id, error = %err, "failed to fetch topic details for search result");
+                        None
+                    }
                 }
             };
             self.send_search_result(chat_id, query, &result, details.as_ref())
@@ -939,18 +984,16 @@ impl App {
             .and_then(|details| details.downloads)
             .unwrap_or(result.downloads);
         let category_line = match category {
-            Some(category) => format!(
-                "<a href=\"{}\">{}</a>",
-                html_escape(&self.rutracker.category_url(category.id)?),
-                html_escape(&category.name)
-            ),
+            Some(category) => self.category_link(category, result.category_url.as_deref())?,
             None => "unknown".to_string(),
         };
         let magnet = details
             .and_then(|details| details.magnet.as_deref())
+            .or(result.magnet.as_deref())
             .map(str::to_string);
         let metadata_lines = details
             .map(format_topic_metadata_lines)
+            .or_else(|| format_search_metadata_lines(result))
             .filter(|lines| !lines.is_empty())
             .map(|lines| format!("{lines}\n"))
             .unwrap_or_default();
@@ -966,17 +1009,24 @@ impl App {
             downloads,
         );
 
-        let mut rows = vec![
-            vec![
-                callback_button("Description", &format!("desc:{}", result.topic_id)),
-                callback_button("Comments", &format!("comments:{}:1", result.topic_id)),
-                callback_button("Files", &format!("files:{}", result.topic_id)),
-            ],
-            vec![
+        let mut rows = if result.local_catalog {
+            vec![vec![
                 callback_button("Download", &format!("dl:{}", result.topic_id)),
                 magnet_button(magnet.as_deref(), result.topic_id),
-            ],
-        ];
+            ]]
+        } else {
+            vec![
+                vec![
+                    callback_button("Description", &format!("desc:{}", result.topic_id)),
+                    callback_button("Comments", &format!("comments:{}:1", result.topic_id)),
+                    callback_button("Files", &format!("files:{}", result.topic_id)),
+                ],
+                vec![
+                    callback_button("Download", &format!("dl:{}", result.topic_id)),
+                    magnet_button(magnet.as_deref(), result.topic_id),
+                ],
+            ]
+        };
         if let Some(category) = category.filter(|_| !query.is_empty()) {
             rows.push(vec![callback_button(
                 &format!("Category: {}", truncate_button_text(&category.name, 50)),
@@ -1197,6 +1247,26 @@ impl App {
         ))
     }
 
+    fn category_link(
+        &self,
+        category: &crate::rutracker::CategoryRef,
+        category_url: Option<&str>,
+    ) -> Result<String> {
+        let owned_url;
+        let url = match category_url {
+            Some(url) => url,
+            None => {
+                owned_url = self.rutracker.category_url(category.id)?;
+                &owned_url
+            }
+        };
+        Ok(format!(
+            "<a href=\"{}\">{}</a>",
+            html_escape(url),
+            html_escape(&category.name)
+        ))
+    }
+
     fn topic_message_with_files(
         &self,
         topic: &TopicDetails,
@@ -1392,6 +1462,17 @@ impl App {
         reply_markup: Option<Value>,
         current_text: Option<String>,
     ) -> Result<()> {
+        if let Some(local_result) = self.cached_local_result(topic_id) {
+            return self
+                .handle_local_download_prompt(
+                    chat_id,
+                    topic_id,
+                    progress,
+                    reply_markup,
+                    local_result,
+                )
+                .await;
+        }
         let topic = match self.cached_topic(topic_id).await {
             Ok(topic) => topic,
             Err(err) => {
@@ -1413,12 +1494,101 @@ impl App {
         let all_files_label = all_files_button_label(&topic, self.config.max_file_mb);
         let reply_markup = download_prompt_reply_markup(reply_markup, topic_id, &all_files_label);
         if let Some(progress) = progress {
-            self.telegram
-                .edit_message(progress, &text, reply_markup)
+            match self
+                .telegram
+                .edit_message(progress, &text, reply_markup.clone())
                 .await
+            {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    warn!(
+                        topic_id,
+                        error = %err,
+                        "failed to edit download prompt text; trying to edit buttons only"
+                    );
+                    self.telegram
+                        .edit_message_reply_markup(progress, reply_markup)
+                        .await?;
+                    self.telegram
+                        .send_message_reply_to(
+                            chat_id,
+                            progress.message_id,
+                            &download_prompt_text(self.config.max_file_mb),
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            }
         } else {
             self.telegram
                 .send_message(chat_id, &text, reply_markup)
+                .await
+        }
+    }
+
+    async fn handle_local_download_prompt(
+        &self,
+        chat_id: i64,
+        topic_id: u64,
+        progress: Option<ProgressMessage>,
+        reply_markup: Option<Value>,
+        result: SearchResult,
+    ) -> Result<()> {
+        let Some(magnet) = result.magnet.as_deref() else {
+            self.telegram
+                .send_message(
+                    chat_id,
+                    "Magnet link is unavailable in the local catalog.",
+                    None,
+                )
+                .await?;
+            return Ok(());
+        };
+        let downloader = self.downloader(topic_id);
+        let metadata = match self
+            .cached_metadata(topic_id, magnet, &downloader, 120)
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                let text = format!(
+                    "Cannot load torrent metadata for download options: {}",
+                    html_escape(&err.to_string())
+                );
+                if let Some(progress) = progress {
+                    self.telegram
+                        .edit_message(progress, &text, reply_markup)
+                        .await?;
+                } else {
+                    self.telegram.send_message(chat_id, &text, None).await?;
+                }
+                return Ok(());
+            }
+        };
+        let all_files_label =
+            all_files_button_label_from_metadata(&metadata, self.config.max_file_mb);
+        let reply_markup = download_prompt_reply_markup(reply_markup, topic_id, &all_files_label);
+        if let Some(progress) = progress {
+            self.telegram
+                .edit_message_reply_markup(progress, reply_markup)
+                .await?;
+            self.telegram
+                .send_message_reply_to(
+                    chat_id,
+                    progress.message_id,
+                    &download_prompt_text(self.config.max_file_mb),
+                    None,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            self.telegram
+                .send_message(
+                    chat_id,
+                    &download_prompt_text(self.config.max_file_mb),
+                    reply_markup,
+                )
                 .await
         }
     }
@@ -1482,8 +1652,8 @@ impl App {
                 false,
             ),
         };
-        let topic = match self.cached_topic(topic_id).await {
-            Ok(topic) => topic,
+        let magnet = match self.download_magnet(topic_id).await {
+            Ok(magnet) => magnet,
             Err(err) => {
                 if preserve_message_body {
                     self.send_rutracker_unavailable(chat_id, &err).await?;
@@ -1493,10 +1663,9 @@ impl App {
                 return Ok(());
             }
         };
-        let magnet = require_magnet(&topic)?;
         let downloader = self.downloader(topic_id);
         let metadata = match self
-            .cached_metadata(topic_id, magnet, &downloader, 120)
+            .cached_metadata(topic_id, &magnet, &downloader, 120)
             .await
         {
             Ok(metadata) => metadata,
@@ -1630,10 +1799,9 @@ impl App {
         &self,
         selection: &DownloadSelection,
     ) -> Result<TorrentMetadata> {
-        let topic = self.cached_topic(selection.topic_id).await?;
-        let magnet = require_magnet(&topic)?;
+        let magnet = self.download_magnet(selection.topic_id).await?;
         let downloader = self.downloader(selection.topic_id);
-        self.cached_metadata(selection.topic_id, magnet, &downloader, 120)
+        self.cached_metadata(selection.topic_id, &magnet, &downloader, 120)
             .await
     }
 
@@ -1734,16 +1902,7 @@ impl App {
             total_seconds,
         );
 
-        let topic = match self.cached_topic(topic_id).await {
-            Ok(topic) => topic,
-            Err(err) => {
-                countdown.stop();
-                typing.stop();
-                self.edit_rutracker_unavailable(progress, &err).await?;
-                return Ok(());
-            }
-        };
-        let magnet = match require_magnet(&topic) {
+        let magnet = match self.download_magnet(topic_id).await {
             Ok(magnet) => magnet.to_string(),
             Err(err) => {
                 countdown.stop();
@@ -1793,8 +1952,13 @@ impl App {
             )
             .await;
         let telegram = self.telegram.clone();
-        let title = topic.title.clone();
-        let topic_url = self.rutracker.topic_url(topic.topic_id)?;
+        let (title, topic_url) = match self.cached_local_result(topic_id) {
+            Some(result) => (result.title, result.topic_url),
+            None => {
+                let topic = self.cached_topic(topic_id).await?;
+                (topic.title, self.rutracker.topic_url(topic_id)?)
+            }
+        };
         let outcome = match downloader
             .download_small_files(
                 DownloadRequest {
@@ -1988,16 +2152,63 @@ impl App {
         ) {
             return Ok(value);
         }
-        let value = self
+        let value = match self
             .rutracker
             .search(query, forum_id, self.config.search_limit)
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                if let Some(value) = self.offline_catalog_search(query, forum_id, &err)? {
+                    value
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         cache_set(
             SEARCH_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
             key,
             value.clone(),
         );
         Ok(value)
+    }
+
+    fn offline_catalog_search(
+        &self,
+        query: &str,
+        forum_id: Option<u64>,
+        live_error: &anyhow::Error,
+    ) -> Result<Option<Vec<SearchResult>>> {
+        let Some(catalog) = self.offline_catalog.as_ref() else {
+            return Ok(None);
+        };
+        if !catalog.exists() {
+            warn!(error = %live_error, "RuTracker unavailable and local catalog is not installed");
+            return Ok(None);
+        }
+        match catalog.search(query, forum_id, self.config.search_limit) {
+            Ok(results) if results.is_empty() => {
+                warn!(error = %live_error, "RuTracker unavailable and local catalog returned no matches");
+                Ok(None)
+            }
+            Ok(results) => {
+                warn!(
+                    error = %live_error,
+                    results = results.len(),
+                    "RuTracker unavailable; using local XML catalog fallback"
+                );
+                Ok(Some(results))
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    live_error = %live_error,
+                    "RuTracker unavailable and local catalog search failed"
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn cached_topic(&self, topic_id: u64) -> Result<TopicDetails> {
@@ -2127,6 +2338,23 @@ impl App {
             value.clone(),
         );
         Ok(value)
+    }
+
+    async fn download_magnet(&self, topic_id: u64) -> Result<String> {
+        if let Some(result) = self.cached_local_result(topic_id)
+            && let Some(magnet) = result.magnet
+        {
+            return Ok(magnet);
+        }
+        let topic = self.cached_topic(topic_id).await?;
+        require_magnet(&topic).map(str::to_string)
+    }
+
+    fn cached_local_result(&self, topic_id: u64) -> Option<SearchResult> {
+        cache_get(
+            LOCAL_RESULT_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            &topic_id,
+        )
     }
 }
 
@@ -2563,6 +2791,8 @@ fn help_text(max_file_mb: u64) -> String {
             "{}\n\n",
             "Torrent downloads use librqbit, the rqbit torrent client library: ",
             "https://github.com/ikatson/rqbit\n\n",
+            "When RuTracker is unavailable after retries, VM deployments can search a local index built from RuTracker's XML dump fallback: ",
+            "https://rutracker.org/forum/viewtopic.php?t=5591249\n\n",
             "AWS Lambda can run one invocation for at most 15 minutes: ",
             "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
             "If RuTracker is unavailable, I return the official news channel link: @rutracker_news. ",
@@ -2746,6 +2976,19 @@ fn all_files_button_label(topic: &TopicDetails, max_file_mb: u64) -> String {
         .first_post_files
         .iter()
         .any(|file| file.size_bytes.is_some_and(|size| size > safe_bytes));
+    all_files_button_label_for_oversized(has_oversized_file, max_file_mb)
+}
+
+fn all_files_button_label_from_metadata(metadata: &TorrentMetadata, max_file_mb: u64) -> String {
+    let safe_bytes = telegram_safe_file_bytes(max_file_mb);
+    let has_oversized_file = metadata
+        .files
+        .iter()
+        .any(|file| file.size_bytes > safe_bytes);
+    all_files_button_label_for_oversized(has_oversized_file, max_file_mb)
+}
+
+fn all_files_button_label_for_oversized(has_oversized_file: bool, max_file_mb: u64) -> String {
     if has_oversized_file {
         format!("All under {}", upload_limit_label(max_file_mb))
     } else {
@@ -2850,6 +3093,17 @@ fn format_topic_metadata_lines(topic: &TopicDetails) -> String {
     lines.join("\n")
 }
 
+fn format_search_metadata_lines(result: &SearchResult) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(published) = result.published.as_ref() {
+        lines.push(format!("Published: {}", html_escape(published)));
+    }
+    if result.local_catalog {
+        lines.push("Found in local XML catalog fallback; comments are unavailable.".to_string());
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn format_description_html(description: &str) -> String {
     let lines = description.lines().collect::<Vec<_>>();
     let mut out = String::new();
@@ -2947,6 +3201,8 @@ mod tests {
             seed_torrents: false,
             torrent_listen_port: 49152,
             seed_disk_reserve_mb: 0,
+            rutracker_catalog_path: None,
+            rutracker_catalog_xml_topic_id: crate::catalog::DEFAULT_RUTRACKER_CATALOG_TOPIC_ID,
         };
         let rutracker = RutrackerClient::new(&base_urls, None, None, 1, 1).unwrap();
         App {
@@ -2956,6 +3212,7 @@ mod tests {
                 "https://api.telegram.org".to_string(),
             ),
             rutracker,
+            offline_catalog: None,
         }
     }
 
@@ -3556,6 +3813,8 @@ mod tests {
     fn help_mentions_limits_unofficial_status_and_donations() {
         let help = help_text(50);
         assert!(help.contains("https://github.com/ikatson/rqbit"));
+        assert!(help.contains("https://rutracker.org/forum/viewtopic.php?t=5591249"));
+        assert!(help.contains("local index built from RuTracker's XML dump fallback"));
         assert!(help.contains("<code>/author</code>"));
         assert!(help.contains("<code>/stat</code>"));
         assert!(help.contains("Category buttons return the 10 most recent topics"));
