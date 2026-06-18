@@ -14,6 +14,11 @@ use crate::rutracker::{CategoryRef, SearchResult};
 pub const DEFAULT_RUTRACKER_CATALOG_TOPIC_ID: u64 = 5_591_249;
 const DEFAULT_TRACKER_ID: u16 = 4;
 const INSERT_BATCH_SIZE: u64 = 10_000;
+const META_SOURCE_TOPIC_ID: &str = "source_topic_id";
+const META_SOURCE_TOPIC_TITLE: &str = "source_topic_title";
+const META_SOURCE_TOPIC_DATE: &str = "source_topic_date";
+const META_SOURCE_MAGNET: &str = "source_magnet";
+const META_SOURCE_INFO_HASH: &str = "source_info_hash";
 
 #[derive(Clone, Debug)]
 pub struct OfflineCatalog {
@@ -25,6 +30,15 @@ pub struct OfflineCatalog {
 pub struct CatalogBuildStats {
     pub torrents: u64,
     pub forums: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CatalogSourceMetadata {
+    pub topic_id: u64,
+    pub topic_title: Option<String>,
+    pub topic_date: Option<String>,
+    pub magnet: String,
+    pub info_hash: String,
 }
 
 #[derive(Default)]
@@ -263,6 +277,61 @@ impl OfflineCatalog {
 /// Rebuilds the local SQLite catalog from a RuTracker XML dump and swaps it in
 /// atomically after the new database passes SQLite integrity checks.
 pub fn rebuild_catalog_from_xml(xml_path: &Path, db_path: &Path) -> Result<CatalogBuildStats> {
+    rebuild_catalog_from_xml_inner(xml_path, db_path, None)
+}
+
+/// Rebuilds the local SQLite catalog and stores metadata about the RuTracker
+/// XML dump source so later updater runs can skip unchanged dumps.
+pub fn rebuild_catalog_from_xml_with_source(
+    xml_path: &Path,
+    db_path: &Path,
+    source: &CatalogSourceMetadata,
+) -> Result<CatalogBuildStats> {
+    rebuild_catalog_from_xml_inner(xml_path, db_path, Some(source))
+}
+
+/// Reads the XML dump source metadata stored in the catalog database.
+///
+/// The monthly updater uses this to avoid downloading and rebuilding the
+/// large RuTracker XML dump when the upstream torrent has not changed.
+pub fn read_catalog_source_metadata(db_path: &Path) -> Result<Option<CatalogSourceMetadata>> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open catalog SQLite {}", db_path.display()))?;
+    if !table_exists(&conn, "catalog_meta") {
+        return Ok(None);
+    }
+    let topic_id = catalog_meta_value(&conn, META_SOURCE_TOPIC_ID)?
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
+    let topic_title = catalog_meta_value(&conn, META_SOURCE_TOPIC_TITLE)?;
+    let topic_date = catalog_meta_value(&conn, META_SOURCE_TOPIC_DATE)?;
+    let magnet = catalog_meta_value(&conn, META_SOURCE_MAGNET)?.unwrap_or_default();
+    let info_hash = catalog_meta_value(&conn, META_SOURCE_INFO_HASH)?.unwrap_or_default();
+    if topic_id == 0
+        && topic_title.is_none()
+        && topic_date.is_none()
+        && magnet.is_empty()
+        && info_hash.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(CatalogSourceMetadata {
+        topic_id,
+        topic_title,
+        topic_date,
+        magnet,
+        info_hash,
+    }))
+}
+
+fn rebuild_catalog_from_xml_inner(
+    xml_path: &Path,
+    db_path: &Path,
+    source: Option<&CatalogSourceMetadata>,
+) -> Result<CatalogBuildStats> {
     let parent = db_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("catalog DB path must have a parent directory"))?;
@@ -277,8 +346,9 @@ pub fn rebuild_catalog_from_xml(xml_path: &Path, db_path: &Path) -> Result<Catal
             )
         })?;
     }
+    remove_sqlite_sidecars(&tmp_path)?;
 
-    let stats = build_catalog_database(xml_path, &tmp_path)?;
+    let stats = build_catalog_database(xml_path, &tmp_path, source)?;
     validate_sqlite_integrity(&tmp_path)?;
     fs::rename(&tmp_path, db_path).with_context(|| {
         format!(
@@ -287,10 +357,15 @@ pub fn rebuild_catalog_from_xml(xml_path: &Path, db_path: &Path) -> Result<Catal
             tmp_path.display()
         )
     })?;
+    remove_sqlite_sidecars(&tmp_path)?;
     Ok(stats)
 }
 
-fn build_catalog_database(xml_path: &Path, db_path: &Path) -> Result<CatalogBuildStats> {
+fn build_catalog_database(
+    xml_path: &Path,
+    db_path: &Path,
+    source: Option<&CatalogSourceMetadata>,
+) -> Result<CatalogBuildStats> {
     let mut conn = Connection::open(db_path)
         .with_context(|| format!("failed to create catalog SQLite {}", db_path.display()))?;
     conn.execute_batch(
@@ -317,6 +392,9 @@ fn build_catalog_database(xml_path: &Path, db_path: &Path) -> Result<CatalogBuil
     )?;
 
     let tx = conn.transaction()?;
+    if let Some(source) = source {
+        insert_source_metadata(&tx, source)?;
+    }
     let mut state = XmlState::default();
     let input = open_xml_input(xml_path)?;
     let mut reader = Reader::from_reader(input);
@@ -390,7 +468,7 @@ fn build_catalog_database(xml_path: &Path, db_path: &Path) -> Result<CatalogBuil
         );
         INSERT INTO torrent_fts(rowid, title)
             SELECT topic_id, title FROM torrent;
-        PRAGMA journal_mode = WAL;
+        PRAGMA journal_mode = DELETE;
         PRAGMA synchronous = NORMAL;
         ",
     )?;
@@ -405,7 +483,8 @@ fn open_xml_input(path: &Path) -> Result<Box<dyn BufRead>> {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("xz"))
     {
-        Box::new(BufReader::new(XzDecoder::new(file)))
+        // RuTracker's XML dump is published as concatenated XZ streams.
+        Box::new(BufReader::new(XzDecoder::new_multi_decoder(file)))
     } else {
         Box::new(BufReader::new(file))
     };
@@ -568,6 +647,40 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
     .is_some()
 }
 
+fn catalog_meta_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM catalog_meta WHERE key = ? LIMIT 1",
+        [key],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("failed to read catalog metadata")
+}
+
+fn insert_source_metadata(conn: &Connection, source: &CatalogSourceMetadata) -> Result<()> {
+    insert_catalog_meta(conn, META_SOURCE_TOPIC_ID, &source.topic_id.to_string())?;
+    insert_catalog_meta(conn, META_SOURCE_MAGNET, &source.magnet)?;
+    insert_catalog_meta(conn, META_SOURCE_INFO_HASH, &source.info_hash)?;
+    if let Some(topic_title) = source.topic_title.as_deref() {
+        insert_catalog_meta(conn, META_SOURCE_TOPIC_TITLE, topic_title)?;
+    }
+    if let Some(topic_date) = source.topic_date.as_deref() {
+        insert_catalog_meta(conn, META_SOURCE_TOPIC_DATE, topic_date)?;
+    }
+    Ok(())
+}
+
+fn insert_catalog_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO catalog_meta(key, value) VALUES (?, ?)",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 fn current_select_sql(where_sql: &str, forum_id: Option<u64>) -> String {
     let mut sql = format!(
         "SELECT torrent.topic_id, torrent.title, torrent.info_hash, torrent.tracker_id, \
@@ -647,10 +760,29 @@ fn limit_to_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
 }
 
+fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            fs::remove_file(&sidecar).with_context(|| {
+                format!("failed to remove SQLite sidecar {}", sidecar.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OfflineCatalog, fts_query, like_pattern, rebuild_catalog_from_xml};
+    use super::{
+        CatalogSourceMetadata, OfflineCatalog, fts_query, like_pattern,
+        read_catalog_source_metadata, rebuild_catalog_from_xml,
+        rebuild_catalog_from_xml_with_source,
+    };
     use std::fs;
+    use std::io::Write;
 
     #[test]
     fn escapes_like_patterns() {
@@ -692,5 +824,111 @@ mod tests {
         assert_eq!(results[0].category.as_ref().unwrap().id, 441);
         assert!(results[0].magnet.as_ref().unwrap().contains("bt4.t-ru.org"));
         assert!(results[0].local_catalog);
+    }
+
+    #[test]
+    fn stores_catalog_source_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("backup.20260530.xml");
+        let db_path = dir.path().join("rutracker.sqlite");
+        fs::write(
+            &xml_path,
+            r#"<root>
+<torrent id="5733243" registred_at="2019.06.04 12:00:00" unixts="1559649600" size="110624768">
+  <title>(Rap, Trip-hop) Meanna - Внутренняя жизнь - 2019, MP3</title>
+  <torrent hash="0123456789ABCDEF0123456789ABCDEF01234567" tracker_id="4"/>
+  <forum id="441">Музыка - Отечественный Рэп, Хип-Хоп (lossy)</forum>
+</torrent>
+</root>"#,
+        )
+        .unwrap();
+        let source = CatalogSourceMetadata {
+            topic_id: 5_591_249,
+            topic_title: Some("RuTracker XML dump".to_string()),
+            topic_date: Some("2026-may-30".to_string()),
+            magnet: "magnet:?xt=urn:btih:ABCDEF".to_string(),
+            info_hash: "ABCDEF".to_string(),
+        };
+
+        rebuild_catalog_from_xml_with_source(&xml_path, &db_path, &source).unwrap();
+
+        assert_eq!(
+            read_catalog_source_metadata(&db_path).unwrap(),
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn rebuilds_catalog_from_concatenated_xz_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("backup.20260530.xml.xz");
+        let db_path = dir.path().join("rutracker.sqlite");
+        let first = r#"<root>
+<torrent id="5733243" registred_at="2019.06.04 12:00:00" unixts="1559649600" size="110624768">
+  <title>(Rap, Trip-hop) Meanna - Внутренняя жизнь - 2019, MP3</title>
+  <torrent hash="0123456789ABCDEF0123456789ABCDEF01234567" tracker_id="4"/>
+  <forum id="441">Музыка - Отечественный Рэп, Хип-Хоп (lossy)</forum>
+</torrent>
+"#;
+        let second = r#"<torrent id="6190907" registred_at="2022.05.02 12:00:00" unixts="1651492800" size="114819072">
+  <title>(Rap, Trip-hop) Meanna - Компиляция Mine - 2012, MP3</title>
+  <torrent hash="89ABCDEF012345670123456789ABCDEF01234567" tracker_id="4"/>
+  <forum id="441">Музыка - Отечественный Рэп, Хип-Хоп (lossy)</forum>
+</torrent>
+</root>"#;
+        let mut compressed = Vec::new();
+        compressed.extend(xz_stream(first.as_bytes()));
+        compressed.extend(xz_stream(second.as_bytes()));
+        fs::write(&xml_path, compressed).unwrap();
+
+        let stats = rebuild_catalog_from_xml(&xml_path, &db_path).unwrap();
+        assert_eq!(stats.torrents, 2);
+
+        let catalog = OfflineCatalog::new(db_path, "https://rutracker.org/forum".to_string());
+        let results = catalog.search("meanna", Some(441), 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].topic_id, 6190907);
+        assert_eq!(results[1].topic_id, 5733243);
+    }
+
+    #[test]
+    fn rebuilds_catalog_from_windows_1251_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml_path = dir.path().join("backup.20260530.xml");
+        let db_path = dir.path().join("rutracker.sqlite");
+        let mut xml = Vec::new();
+        xml.extend_from_slice(
+            br#"<?xml version="1.0" encoding="windows-1251"?><root>
+<torrent id="1" registred_at="2026.05.30 12:00:00" unixts="1780142400" size="123">
+  <title>"#,
+        );
+        xml.extend_from_slice(&[0xCC, 0xF3, 0xE7, 0xFB, 0xEA, 0xE0]);
+        xml.extend_from_slice(
+            br#"</title>
+  <torrent hash="0123456789ABCDEF0123456789ABCDEF01234567" tracker_id="4"/>
+  <forum id="2">"#,
+        );
+        xml.extend_from_slice(&[0xCC, 0xF3, 0xE7, 0xFB, 0xEA, 0xE0]);
+        xml.extend_from_slice(
+            br#"</forum>
+</torrent>
+</root>"#,
+        );
+        fs::write(&xml_path, xml).unwrap();
+
+        let stats = rebuild_catalog_from_xml(&xml_path, &db_path).unwrap();
+        assert_eq!(stats.torrents, 1);
+
+        let catalog = OfflineCatalog::new(db_path, "https://rutracker.org/forum".to_string());
+        let results = catalog.search("Музыка", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Музыка");
+        assert_eq!(results[0].category.as_ref().unwrap().name, "Музыка");
+    }
+
+    fn xz_stream(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
     }
 }

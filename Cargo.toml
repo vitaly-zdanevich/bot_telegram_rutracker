@@ -1,6 +1,6 @@
 [package]
 name = "telegram-rutracker-bot"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
@@ -20,7 +20,7 @@ mime_guess = "2"
 nix = { version = "0.30", features = ["fs"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "multipart", "rustls-tls", "stream"] }
-quick-xml = "0.38"
+quick-xml = { version = "0.38", features = ["encoding"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 scraper = "0.24"
 serde = { version = "1", features = ["derive"] }

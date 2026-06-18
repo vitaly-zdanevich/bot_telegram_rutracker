@@ -146,7 +146,7 @@ For Oracle VM mode, the VM runs tdlib's `telegram-bot-api` with `--local`, sets 
 
 Oracle VM mode also sets `SEED_TORRENTS=true` by default, opens `torrent_listen_port` for TCP and UDP peer traffic, and keeps seeded data under the bot `TMP_DIR`. The bot already knows the selected download size before adding a torrent; set `seed_disk_reserve_mb` only if you want extra free disk space beyond that.
 
-Oracle VM mode enables a local fallback catalog by default. A monthly systemd timer downloads RuTracker's current unofficial XML dump topic with the Rust torrent client, rebuilds a local SQLite FTS index, and the bot searches that index only after live RuTracker search fails all retries. The fallback does not include live comments.
+Oracle VM mode enables a local fallback catalog by default. A monthly systemd timer checks RuTracker's current unofficial XML dump topic, skips the run when the saved SQLite source info-hash or topic date is unchanged, otherwise downloads the dump with the Rust torrent client and rebuilds a local SQLite FTS index. The bot searches that index only after live RuTracker search fails all retries. The fallback does not include live comments.
 
 For VM-only mode without Lambda, stop `telegram-rutracker-vm-worker.service` and enable `telegram-rutracker-poller.service`. The poller calls `deleteWebhook` before using `getUpdates`.
 

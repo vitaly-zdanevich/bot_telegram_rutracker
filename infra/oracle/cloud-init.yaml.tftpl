@@ -1,6 +1,7 @@
 #cloud-config
 package_update: true
 packages:
+  - btop
   - ca-certificates
   - clang
   - cmake
@@ -12,11 +13,19 @@ packages:
   - libssl-dev
   - liblzma-dev
   - make
+  - ncdu
   - pkg-config
+  - sqlite3
   - xz-utils
   - zlib1g-dev
 
 write_files:
+  - path: /etc/profile.d/rustup-system.sh
+    owner: root:root
+    permissions: "0644"
+    content: |
+      export RUSTUP_HOME=/opt/rust/rustup
+      export PATH=/opt/rust/cargo/bin:$PATH
   - path: /etc/telegram-rutracker-bot.env
     owner: root:root
     permissions: "0600"
@@ -185,10 +194,16 @@ write_files:
       install -d -m 0755 -o telegrambot -g telegrambot /var/lib/telegram-bot-api /var/lib/telegram-bot-api/tmp /var/lib/telegram-rutracker-bot /var/lib/telegram-rutracker-bot/tmp
       iptables -C INPUT -p tcp -m tcp --dport 8080 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 8080 -j ACCEPT
 
-      if ! command -v cargo >/dev/null 2>&1; then
-        curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+      install -d -m 0755 /opt/rust/rustup /opt/rust/cargo
+      export RUSTUP_HOME=/opt/rust/rustup
+      export CARGO_HOME=/opt/rust/cargo
+      export PATH=/opt/rust/cargo/bin:$PATH
+      if ! [ -x /opt/rust/cargo/bin/rustup ]; then
+        curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
       fi
-      . /root/.cargo/env
+      rustup toolchain install stable --profile minimal
+      rustup default stable
+      chmod -R a+rX /opt/rust
 
       if [ ! -d /opt/telegram-rutracker/src/telegram-bot-api/.git ]; then
         git clone --recursive https://github.com/tdlib/telegram-bot-api.git /opt/telegram-rutracker/src/telegram-bot-api

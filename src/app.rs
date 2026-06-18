@@ -2791,7 +2791,7 @@ fn help_text(max_file_mb: u64) -> String {
             "{}\n\n",
             "Torrent downloads use librqbit, the rqbit torrent client library: ",
             "https://github.com/ikatson/rqbit\n\n",
-            "When RuTracker is unavailable after retries, VM deployments can search a local index built from RuTracker's XML dump fallback: ",
+            "When RuTracker is unavailable after retries, VM deployments can search a local SQLite index built from RuTracker's XML dump fallback: ",
             "https://rutracker.org/forum/viewtopic.php?t=5591249\n\n",
             "AWS Lambda can run one invocation for at most 15 minutes: ",
             "https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html\n\n",
@@ -3814,7 +3814,7 @@ mod tests {
         let help = help_text(50);
         assert!(help.contains("https://github.com/ikatson/rqbit"));
         assert!(help.contains("https://rutracker.org/forum/viewtopic.php?t=5591249"));
-        assert!(help.contains("local index built from RuTracker's XML dump fallback"));
+        assert!(help.contains("local SQLite index built from RuTracker's XML dump fallback"));
         assert!(help.contains("<code>/author</code>"));
         assert!(help.contains("<code>/stat</code>"));
         assert!(help.contains("Category buttons return the 10 most recent topics"));
