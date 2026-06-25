@@ -107,6 +107,7 @@ write_files:
       Description=Telegram RuTracker VM worker
       After=network-online.target telegram-rutracker-firewall.service telegram-bot-api.service
       Wants=network-online.target telegram-rutracker-firewall.service telegram-bot-api.service
+      Conflicts=telegram-rutracker-poller.service
 
       [Service]
       User=telegrambot
@@ -128,6 +129,7 @@ write_files:
       Description=Telegram RuTracker bot poller
       After=network-online.target telegram-bot-api.service
       Wants=network-online.target telegram-bot-api.service
+      Conflicts=telegram-rutracker-vm-worker.service
 
       [Service]
       User=telegrambot
@@ -230,6 +232,8 @@ write_files:
       systemctl daemon-reload
       systemctl enable --now telegram-rutracker-firewall.service
       systemctl enable --now telegram-bot-api.service
+      # Keep webhook delivery and long polling mutually exclusive.
+      systemctl disable --now telegram-rutracker-poller.service || true
       systemctl enable --now telegram-rutracker-vm-worker.service
       systemctl enable --now rutracker-catalog-updater.timer
       systemctl start --no-block rutracker-catalog-updater.service || true
