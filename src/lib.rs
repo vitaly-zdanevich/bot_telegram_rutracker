@@ -2,6 +2,7 @@ pub mod app;
 pub mod catalog;
 pub mod config;
 pub mod downloader;
+pub mod image_cache;
 pub mod rutracker;
 pub mod telegram;
 pub mod torrent;

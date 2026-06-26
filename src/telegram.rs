@@ -10,17 +10,24 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{BytesCodec, FramedRead};
-use tracing::warn;
+use tracing::{info, warn};
 
 // Telegram documents message text as 1-4096 characters after entity parsing.
 // https://core.telegram.org/bots/api#editmessagetext
 pub const TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS: usize = 4096;
+// Telegram rich messages are limited to 32768 UTF-8 characters.
+// https://core.telegram.org/bots/api#rich-message-limits
+pub const TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS: usize = 32_768;
+// Telegram rich messages can include up to 50 media blocks.
+// https://core.telegram.org/bots/api#rich-message-limits
+pub const TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT: usize = 50;
 // Telegram captions are limited to 0-1024 characters after entity parsing.
 // https://core.telegram.org/bots/api#sendphoto
 pub const TELEGRAM_CAPTION_LIMIT_CHARS: usize = 1024;
 // Telegram Bot API documents sendPhoto uploads as limited to 10 MB.
 // https://core.telegram.org/bots/api#sendphoto
 const TELEGRAM_PHOTO_UPLOAD_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const TELEGRAM_RICH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Debug, Deserialize)]
 pub struct Update {
@@ -81,6 +88,12 @@ pub struct Telegram {
 pub struct ChatActionHeartbeat {
     stop: Arc<AtomicBool>,
     task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RichMessageDelivery {
+    Rich,
+    TextFallback,
 }
 
 pub struct StatusCountdown {
@@ -162,6 +175,36 @@ impl Telegram {
         self.telegram_json_value("sendMessage", payload).await
     }
 
+    pub async fn send_rich_message_or_text(
+        &self,
+        chat_id: i64,
+        rich_html: &str,
+        fallback_html: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<RichMessageDelivery> {
+        let payload = self.send_rich_message_payload(chat_id, rich_html, reply_markup.clone());
+        match tokio::time::timeout(
+            Duration::from_secs(TELEGRAM_RICH_REQUEST_TIMEOUT_SECONDS),
+            self.telegram_json_value("sendRichMessage", payload),
+        )
+        .await
+        {
+            Err(_) => {
+                warn!("timed out sending Telegram rich message; falling back to sendMessage");
+                self.send_message(chat_id, fallback_html, reply_markup)
+                    .await
+                    .map(|_| RichMessageDelivery::TextFallback)
+            }
+            Ok(Ok(_)) => Ok(RichMessageDelivery::Rich),
+            Ok(Err(err)) => {
+                warn!(error = %err, "failed to send Telegram rich message; falling back to sendMessage");
+                self.send_message(chat_id, fallback_html, reply_markup)
+                    .await
+                    .map(|_| RichMessageDelivery::TextFallback)
+            }
+        }
+    }
+
     /// Builds the shared sendMessage JSON payload so normal messages and
     /// reply messages keep identical parsing, previews, and truncation.
     fn send_message_payload(
@@ -181,6 +224,26 @@ impl Telegram {
         }
         if let Some(parse_mode) = parse_mode {
             payload["parse_mode"] = json!(parse_mode);
+        }
+        payload
+    }
+
+    fn send_rich_message_payload(
+        &self,
+        chat_id: i64,
+        html: &str,
+        reply_markup: Option<Value>,
+    ) -> Value {
+        let html = rich_message_html(html);
+        log_rich_message_html_diagnostic("sendRichMessage", &html);
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "rich_message": {
+                "html": html,
+            }
+        });
+        if let Some(markup) = reply_markup {
+            payload["reply_markup"] = markup;
         }
         payload
     }
@@ -219,6 +282,47 @@ impl Telegram {
         self.telegram_json_value("editMessageText", payload)
             .await
             .map(|_| ())
+    }
+
+    pub async fn edit_rich_message_or_text(
+        &self,
+        progress: ProgressMessage,
+        rich_html: &str,
+        fallback_html: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<RichMessageDelivery> {
+        let html = rich_message_html(rich_html);
+        log_rich_message_html_diagnostic("editMessageText", &html);
+        let mut payload = json!({
+            "chat_id": progress.chat_id,
+            "message_id": progress.message_id,
+            "rich_message": {
+                "html": html,
+            }
+        });
+        if let Some(markup) = reply_markup.clone() {
+            payload["reply_markup"] = markup;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(TELEGRAM_RICH_REQUEST_TIMEOUT_SECONDS),
+            self.telegram_json_value("editMessageText", payload),
+        )
+        .await
+        {
+            Err(_) => {
+                warn!("timed out editing Telegram rich message; falling back to editMessageText");
+                self.edit_message(progress, fallback_html, reply_markup)
+                    .await
+                    .map(|_| RichMessageDelivery::TextFallback)
+            }
+            Ok(Ok(_)) => Ok(RichMessageDelivery::Rich),
+            Ok(Err(err)) => {
+                warn!(error = %err, "failed to edit Telegram rich message; falling back to editMessageText");
+                self.edit_message(progress, fallback_html, reply_markup)
+                    .await
+                    .map(|_| RichMessageDelivery::TextFallback)
+            }
+        }
     }
 
     pub async fn edit_message_reply_markup(
@@ -622,6 +726,132 @@ pub fn truncate_for_telegram(value: &str, limit: usize) -> String {
     truncated
 }
 
+fn rich_message_html(value: &str) -> String {
+    let mut html = String::with_capacity(value.len());
+    for (index, ch) in value.char_indices() {
+        if ch == '\n' && starts_with_rich_block(value[index + ch.len_utf8()..].trim_start()) {
+            html.push('\n');
+        } else if ch == '\n' {
+            html.push_str("<br>");
+        } else {
+            html.push(ch);
+        }
+    }
+    truncate_for_telegram(&html, TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS)
+}
+
+fn log_rich_message_html_diagnostic(method: &str, html: &str) {
+    let image_count = html.matches("<img").count();
+    let video_count = html.matches("<video").count();
+    let audio_count = html.matches("<audio").count();
+    if image_count == 0 && video_count == 0 && audio_count == 0 {
+        return;
+    }
+    let media_start = first_media_tag_start(html);
+    let first_media_url = media_start
+        .and_then(|start| first_media_src(&html[start..]))
+        .unwrap_or_default();
+    let media_context = media_start
+        .map(|start| log_context_around(html, start, 180, 420))
+        .unwrap_or_else(|| log_snippet(html, 600));
+    info!(
+        method,
+        chars = html.chars().count(),
+        image_count,
+        video_count,
+        audio_count,
+        first_media_url = %first_media_url,
+        media_context = %media_context,
+        "prepared Telegram rich message HTML"
+    );
+}
+
+fn first_media_tag_start(html: &str) -> Option<usize> {
+    ["<img", "<video", "<audio"]
+        .iter()
+        .filter_map(|tag| html.find(tag))
+        .min()
+}
+
+fn first_media_src(tag_and_tail: &str) -> Option<String> {
+    let tag_end = tag_and_tail.find('>').unwrap_or(tag_and_tail.len());
+    let tag = &tag_and_tail[..tag_end];
+    quoted_attr(tag, "src=\"", '"').or_else(|| quoted_attr(tag, "src='", '\''))
+}
+
+fn quoted_attr(value: &str, needle: &str, quote: char) -> Option<String> {
+    let start = value.find(needle)? + needle.len();
+    let end = value[start..].find(quote)? + start;
+    Some(value[start..end].to_string())
+}
+
+fn log_context_around(value: &str, byte_start: usize, before: usize, after: usize) -> String {
+    let prefix = value[..byte_start]
+        .chars()
+        .rev()
+        .take(before)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let suffix = value[byte_start..].chars().take(after).collect::<String>();
+    let mut snippet = String::new();
+    if value[..byte_start].chars().count() > before {
+        snippet.push('…');
+    }
+    snippet.push_str(&prefix);
+    snippet.push_str(&suffix);
+    if value[byte_start..].chars().count() > after {
+        snippet.push('…');
+    }
+    sanitize_log_snippet(&snippet)
+}
+
+fn log_snippet(value: &str, limit: usize) -> String {
+    let mut snippet = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        snippet.push('…');
+    }
+    sanitize_log_snippet(&snippet)
+}
+
+fn sanitize_log_snippet(value: &str) -> String {
+    value
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn starts_with_rich_block(value: &str) -> bool {
+    [
+        "<audio",
+        "<blockquote",
+        "<details",
+        "<figure",
+        "<footer",
+        "<h1",
+        "<h2",
+        "<h3",
+        "<h4",
+        "<h5",
+        "<h6",
+        "<hr",
+        "<img",
+        "<ol",
+        "<p",
+        "<pre",
+        "<table",
+        "<tg-collage",
+        "<tg-map",
+        "<tg-math-block",
+        "<tg-slideshow",
+        "<ul",
+        "<video",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
 fn remote_file_name(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -712,7 +942,10 @@ pub fn copy_button(text: &str, copy_text: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{Telegram, countdown_status_text};
+    use super::{
+        TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram, countdown_status_text, first_media_src,
+        first_media_tag_start, log_context_around, rich_message_html,
+    };
 
     #[test]
     fn formats_countdown_with_lambda_lifetime() {
@@ -744,6 +977,64 @@ mod tests {
         assert_eq!(
             telegram.method_url("sendDocument"),
             "http://127.0.0.1:8081/bottoken/sendDocument"
+        );
+    }
+
+    #[test]
+    fn builds_rich_message_payload() {
+        let telegram = Telegram::new("token".to_string(), "https://api.telegram.org".to_string());
+        let payload = telegram.send_rich_message_payload(42, "<b>A</b>\nB", None);
+
+        assert_eq!(payload["chat_id"], 42);
+        assert_eq!(payload["rich_message"]["html"], "<b>A</b><br>B");
+    }
+
+    #[test]
+    fn truncates_rich_message_html_to_rich_limit() {
+        let html = rich_message_html(&"x".repeat(TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS + 10));
+
+        assert_eq!(html.chars().count(), TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(html.ends_with('…'));
+    }
+
+    #[test]
+    fn truncates_rich_message_html_after_line_break_expansion() {
+        let html = rich_message_html(&"x\n".repeat(TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS));
+
+        assert_eq!(html.chars().count(), TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(html.ends_with('…'));
+    }
+
+    #[test]
+    fn keeps_media_tags_as_separate_rich_blocks() {
+        assert_eq!(
+            rich_message_html("</blockquote>\n<img src=\"https://example.invalid/photo.jpg\"/>"),
+            "</blockquote>\n<img src=\"https://example.invalid/photo.jpg\"/>"
+        );
+        assert_eq!(
+            rich_message_html(
+                "Album description.\n\n<blockquote><b>Scans</b></blockquote>\n<img src=\"https://example.invalid/a.jpg\"/>\n<img src=\"https://example.invalid/b.jpg\"/>"
+            ),
+            "Album description.\n\n<blockquote><b>Scans</b></blockquote>\n<img src=\"https://example.invalid/a.jpg\"/>\n<img src=\"https://example.invalid/b.jpg\"/>"
+        );
+        assert_eq!(
+            rich_message_html("line one\nline two"),
+            "line one<br>line two"
+        );
+    }
+
+    #[test]
+    fn extracts_media_diagnostic_from_rich_html() {
+        let html = "Intro<br><blockquote><b>Scans</b></blockquote>\n<img src=\"https://example.invalid/a.jpg\"/>\n<img src='https://example.invalid/b.jpg'/>";
+        let media_start = first_media_tag_start(html).unwrap();
+
+        assert_eq!(
+            first_media_src(&html[media_start..]).as_deref(),
+            Some("https://example.invalid/a.jpg")
+        );
+        assert_eq!(
+            log_context_around(html, media_start, 20, 45),
+            "…ns</b></blockquote>\\n<img src=\"https://example.invalid/a.jpg\"/>\\n<i…"
         );
     }
 }

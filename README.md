@@ -162,6 +162,8 @@ Oracle VM mode also sets `SEED_TORRENTS=true` by default, opens `torrent_listen_
 
 Oracle VM mode enables a local fallback catalog by default. A monthly systemd timer checks RuTracker's current unofficial XML dump topic, skips the run when the saved SQLite source info-hash or topic date is unchanged, otherwise downloads the dump with the Rust torrent client and rebuilds a local SQLite FTS index. The bot searches that index only after live RuTracker search fails all retries. The fallback does not include live comments.
 
+Oracle VM mode can also host cached first-post spoiler images for Telegram rich Description messages. Set `image_cache_public_base_url` to the Lambda Function URL such as `https://example.lambda-url.eu-north-1.on.aws`; Lambda proxies `/image-cache/...` to the VM cache over `VM_WORKER_URL`, while the worker stores images under `image_cache_dir`. This avoids giving Telegram original image-host URLs directly: those hosts can reject Telegram fetches through hotlink checks, redirects, placeholders, TLS quirks, or rate limits even when the same URL works in a browser. The cache gives Telegram a stable AWS HTTPS URL with verified image bytes and plain image response headers. The Oracle firewall also redirects public port 80 to the worker on 8080 for direct cache diagnostics.
+
 For VM-only mode without Lambda, stop `telegram-rutracker-vm-worker.service` and enable `telegram-rutracker-poller.service`. The poller calls `deleteWebhook` before using `getUpdates`.
 
 Telegram delivery mode matters: a bot cannot reliably use webhook delivery and long polling at the same time. The poller calls `deleteWebhook` before `getUpdates`. To move a bot to a local Bot API server, tdlib documents using `logOut` from the public server first: https://github.com/tdlib/telegram-bot-api
@@ -180,6 +182,8 @@ Environment variables:
 - `VM_WORKER_SECRET`, HMAC secret shared by the webhook Lambda and VM worker
 - `VM_WORKER_TIMEOUT_MS`, default `1500`
 - `VM_WORKER_BIND`, default `127.0.0.1:8080`, used by `telegram-rutracker-vm-worker`
+- `IMAGE_CACHE_PUBLIC_BASE_URL`, optional public VM worker base URL for cached rich Description images
+- `IMAGE_CACHE_DIR`, default `$TMP_DIR/image-cache`, stores cached rich Description images
 - `ALLOWED_TELEGRAM_USER_IDS`, comma-separated; empty means public
 - `RUTRACKER_BASE_URLS`, comma-separated forum base URLs tried in order; default `https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum`
 - `RUTRACKER_BASE_URL`, backward-compatible single URL fallback when `RUTRACKER_BASE_URLS` is not set

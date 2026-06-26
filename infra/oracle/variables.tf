@@ -58,7 +58,7 @@ variable "ssh_ingress_cidr" {
 }
 
 variable "vm_worker_ingress_cidr" {
-  description = "CIDR allowed to reach the signed VM worker HTTP endpoint."
+  description = "CIDR allowed to reach the VM HTTP endpoint. This must include Telegram clients if IMAGE_CACHE_PUBLIC_BASE_URL points at the VM."
   type        = string
   default     = "0.0.0.0/0"
 }
@@ -164,6 +164,18 @@ variable "rutracker_base_urls" {
   description = "Comma-separated RuTracker forum base URLs tried in order."
   type        = string
   default     = "https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum"
+}
+
+variable "image_cache_public_base_url" {
+  description = "Public VM worker base URL used for cached rich-description images, for example http://203.0.113.10. Empty disables rich image caching."
+  type        = string
+  default     = ""
+}
+
+variable "image_cache_dir" {
+  description = "Directory where the VM worker stores cached rich-description images."
+  type        = string
+  default     = "/var/lib/telegram-rutracker-bot/image-cache"
 }
 
 variable "rutracker_username" {

@@ -20,14 +20,17 @@ use crate::config::Config;
 use crate::downloader::{
     DownloadOutcome, DownloadRequest, SeedConfig, SeedTorrentStats, TorrentDownloader,
 };
+use crate::image_cache;
 use crate::rutracker::{
     AuthorDetails, RutrackerClient, RutrackerCredentials, SearchResult, TopicComment, TopicDetails,
-    TopicFile, ensure_same_topic, require_magnet, validate_forum_query,
+    TopicFile, TopicSpoilerImages, ensure_same_topic, require_magnet, validate_forum_query,
 };
 use crate::telegram::{
-    CallbackQuery, InlineQuery, Message, ProgressMessage, TELEGRAM_CAPTION_LIMIT_CHARS,
-    TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, Telegram, Update, callback_button, copy_button,
-    countdown_status_text, html_escape, inline_keyboard, truncate_for_telegram, url_button,
+    CallbackQuery, InlineQuery, Message, ProgressMessage, RichMessageDelivery,
+    TELEGRAM_CAPTION_LIMIT_CHARS, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS,
+    TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT, TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram, Update,
+    callback_button, copy_button, countdown_status_text, html_escape, inline_keyboard,
+    truncate_for_telegram, url_button,
 };
 use crate::telegram_safe_file_bytes;
 use crate::torrent::{TorrentFile, TorrentMetadata};
@@ -46,6 +49,8 @@ const VM_WORKER_TIMEOUT_MS_ENV: &str = "VM_WORKER_TIMEOUT_MS";
 const VM_WORKER_SIGNATURE_HEADER: &str = "x-telegram-rutracker-signature";
 const VM_WORKER_TIMESTAMP_HEADER: &str = "x-telegram-rutracker-timestamp";
 const VM_WORKER_SIGNATURE_TTL_SECONDS: u64 = 5 * 60;
+const IMAGE_CACHE_ROUTE_PREFIX: &str = "/image-cache/";
+const IMAGE_CACHE_PROXY_TIMEOUT_SECONDS: u64 = 10;
 const AUTHOR_RELEASES_FORUM_ID: u64 = 1538;
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
@@ -81,7 +86,16 @@ struct DownloadSelection {
     page: usize,
 }
 
+struct RichDescriptionMessage {
+    text: String,
+    embedded_spoiler_images: usize,
+}
+
 pub async fn webhook_handler(request: Request) -> Result<impl IntoResponse, Error> {
+    if is_image_cache_proxy_request(&request) {
+        return Ok(proxy_image_cache_request(&request).await?);
+    }
+
     if request.method() != Method::POST {
         return Ok(response(StatusCode::OK, "ok"));
     }
@@ -126,6 +140,80 @@ pub async fn webhook_handler(request: Request) -> Result<impl IntoResponse, Erro
     );
 
     Ok(response(StatusCode::OK, "ok"))
+}
+
+fn is_image_cache_proxy_request(request: &Request) -> bool {
+    matches!(request.method(), &Method::GET | &Method::HEAD)
+        && request.uri().path().starts_with(IMAGE_CACHE_ROUTE_PREFIX)
+}
+
+async fn proxy_image_cache_request(request: &Request) -> Result<Response<Body>> {
+    let file_name = request
+        .uri()
+        .path()
+        .strip_prefix(IMAGE_CACHE_ROUTE_PREFIX)
+        .unwrap_or_default();
+    image_cache::validate_cache_file_name(file_name)?;
+    let url = image_cache_proxy_url(&crate::config::required_env(VM_WORKER_URL_ENV)?, file_name)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(IMAGE_CACHE_PROXY_TIMEOUT_SECONDS))
+        .build()
+        .context("failed to build image cache proxy HTTP client")?;
+    let upstream_response = client
+        .get(url)
+        .send()
+        .await
+        .context("failed to fetch proxied image cache file")?;
+    let status = upstream_response.status();
+    let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        warn!(%status, file_name, "VM image cache proxy returned non-success status");
+        return Ok(response(status, "not found"));
+    }
+    let content_type = upstream_response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("image/"))
+        .ok_or_else(|| anyhow!("proxied image cache file has no image content type"))?
+        .to_string();
+    let content_length = upstream_response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = Body::Binary(
+        upstream_response
+            .bytes()
+            .await
+            .context("failed to read proxied image cache file")?
+            .to_vec(),
+    );
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("cache-control", "public, max-age=2592000, immutable")
+        .header("x-content-type-options", "nosniff");
+    if let Some(content_length) = content_length {
+        builder = builder.header("content-length", content_length);
+    }
+    builder
+        .body(body)
+        .context("failed to build image cache proxy response")
+}
+
+fn image_cache_proxy_url(vm_worker_url: &str, file_name: &str) -> Result<String> {
+    image_cache::validate_cache_file_name(file_name)?;
+    let mut url = url::Url::parse(vm_worker_url)
+        .with_context(|| format!("VM_WORKER_URL has invalid URL {vm_worker_url:?}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => bail!("VM_WORKER_URL must use http or https, got {scheme:?}"),
+    }
+    url.set_path(&format!("image-cache/{file_name}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 /// Handles the private Lambda worker payload after the webhook Lambda has
@@ -618,6 +706,21 @@ impl App {
                 .await?;
             return self.handle_selected_download(chat_id, key).await;
         }
+        if let Some((wrapper_topic_id, release_topic_id)) = parse_author_description_callback(data)
+        {
+            self.telegram
+                .answer_callback(&callback.id, "Loading description...")
+                .await?;
+            return self
+                .handle_author_description(
+                    chat_id,
+                    wrapper_topic_id,
+                    release_topic_id,
+                    callback_message,
+                    callback_reply_markup,
+                )
+                .await;
+        }
         if let Some(topic_id) = data.strip_prefix("desc:").and_then(parse_u64) {
             self.telegram
                 .answer_callback(&callback.id, "Loading description...")
@@ -871,7 +974,7 @@ impl App {
                     }
                 }
             };
-            self.send_search_result(chat_id, query, &result, details.as_ref())
+            self.send_search_result(chat_id, query, &result, details.as_ref(), None)
                 .await?;
         }
         Ok(())
@@ -932,20 +1035,52 @@ impl App {
         self.telegram.try_delete_message(progress).await;
 
         for result in results {
-            let details = match self.cached_topic(result.topic_id).await {
-                Ok(details) => {
-                    ensure_same_topic(&result, &details);
-                    Some(details)
-                }
+            let (result, details, description_callback) = match self
+                .author_release_result(&result)
+                .await
+            {
+                Ok(value) => value,
                 Err(err) => {
                     warn!(topic_id = result.topic_id, error = %err, "failed to fetch topic details for author release");
-                    None
+                    (result, None, None)
                 }
             };
-            self.send_search_result(chat_id, "", &result, details.as_ref())
-                .await?;
+            self.send_search_result(
+                chat_id,
+                "",
+                &result,
+                details.as_ref(),
+                description_callback.as_deref(),
+            )
+            .await?;
         }
         Ok(())
+    }
+
+    async fn author_release_result(
+        &self,
+        result: &SearchResult,
+    ) -> Result<(SearchResult, Option<TopicDetails>, Option<String>)> {
+        let wrapper = self.cached_topic(result.topic_id).await?;
+        ensure_same_topic(result, &wrapper);
+        let Some(release_topic_id) = wrapper.first_post_topic_links.first().copied() else {
+            return Ok((result.clone(), Some(wrapper), None));
+        };
+        let release = self.cached_topic(release_topic_id).await?;
+        let topic_url = self.rutracker.topic_url(release.topic_id)?;
+        let category_url = release
+            .category_path
+            .last()
+            .and_then(|category| self.rutracker.category_url(category.id).ok());
+        let result = author_release_search_result(result, &release, topic_url, category_url);
+        Ok((
+            result,
+            Some(release),
+            Some(author_description_callback(
+                wrapper.topic_id,
+                release_topic_id,
+            )),
+        ))
     }
 
     async fn try_send_typing(&self, chat_id: i64) {
@@ -960,6 +1095,7 @@ impl App {
         query: &str,
         result: &SearchResult,
         details: Option<&TopicDetails>,
+        description_callback: Option<&str>,
     ) -> Result<()> {
         let title = details
             .filter(|details| !details.title.is_empty())
@@ -1027,6 +1163,18 @@ impl App {
                 ],
             ]
         };
+        let default_description_callback = format!("desc:{}", result.topic_id);
+        if let Some(description_callback) = description_callback
+            && let Some(description_button) =
+                rows.iter_mut()
+                    .flat_map(|row| row.iter_mut())
+                    .find(|button| {
+                        button.get("callback_data").and_then(Value::as_str)
+                            == Some(default_description_callback.as_str())
+                    })
+        {
+            description_button["callback_data"] = serde_json::json!(description_callback);
+        }
         if let Some(category) = category.filter(|_| !query.is_empty()) {
             rows.push(vec![callback_button(
                 &format!("Category: {}", truncate_button_text(&category.name, 50)),
@@ -1149,7 +1297,7 @@ impl App {
         }
         for result in latest {
             let details = self.cached_topic(result.topic_id).await.ok();
-            self.send_search_result(chat_id, "", &result, details.as_ref())
+            self.send_search_result(chat_id, "", &result, details.as_ref(), None)
                 .await?;
         }
         Ok(())
@@ -1173,23 +1321,171 @@ impl App {
                 return Ok(());
             }
         };
-        let text = if topic.description_text.is_empty() {
-            self.topic_message_with_description(&topic, "Description is empty or unavailable.")?
-        } else {
-            self.topic_message_with_description(
-                &topic,
-                &format_description_html(&truncate_for_telegram(&topic.description_text, 3000)),
-            )?
-        };
+        let rich_image_sections = self
+            .rich_spoiler_image_sections(&topic.first_post_spoiler_image_sections)
+            .await;
+        let rich_message = self.topic_message_with_rich_description(
+            &topic,
+            &topic.description_text,
+            &rich_image_sections,
+        )?;
+        let fallback_text =
+            self.topic_message_with_classic_description(&topic, &topic.description_text)?;
         let reply_markup = remove_callback_button(reply_markup, &format!("desc:{topic_id}"));
-        if let Some(progress) = progress {
+        let delivery = if let Some(progress) = progress {
             self.telegram
-                .edit_message(progress, &text, reply_markup)
-                .await?;
+                .edit_rich_message_or_text(
+                    progress,
+                    &rich_message.text,
+                    &fallback_text,
+                    reply_markup,
+                )
+                .await?
         } else {
-            self.telegram.send_message(chat_id, &text, None).await?;
-        }
+            self.telegram
+                .send_rich_message_or_text(chat_id, &rich_message.text, &fallback_text, None)
+                .await?
+        };
+        let images = fallback_description_spoiler_images(
+            &topic.first_post_spoiler_image_sections,
+            delivery,
+            rich_message.embedded_spoiler_images,
+        );
+        self.send_description_spoiler_image_urls(chat_id, topic.topic_id, &images)
+            .await;
         Ok(())
+    }
+
+    async fn handle_author_description(
+        &self,
+        chat_id: i64,
+        wrapper_topic_id: u64,
+        release_topic_id: u64,
+        progress: Option<ProgressMessage>,
+        reply_markup: Option<Value>,
+    ) -> Result<()> {
+        let wrapper = match self.cached_topic(wrapper_topic_id).await {
+            Ok(topic) => topic,
+            Err(err) => {
+                if let Some(progress) = progress {
+                    self.edit_rutracker_unavailable(progress, &err).await?;
+                } else {
+                    self.send_rutracker_unavailable(chat_id, &err).await?;
+                }
+                return Ok(());
+            }
+        };
+        let release = match self.cached_topic(release_topic_id).await {
+            Ok(topic) => topic,
+            Err(err) => {
+                if let Some(progress) = progress {
+                    self.edit_rutracker_unavailable(progress, &err).await?;
+                } else {
+                    self.send_rutracker_unavailable(chat_id, &err).await?;
+                }
+                return Ok(());
+            }
+        };
+        let description = combined_author_description(&wrapper, &release);
+        let image_sections = combined_author_spoiler_image_sections(&wrapper, &release);
+        let rich_image_sections = self.rich_spoiler_image_sections(&image_sections).await;
+        let rich_message =
+            self.topic_message_with_rich_description(&release, &description, &rich_image_sections)?;
+        let fallback_text = self.topic_message_with_classic_description(&release, &description)?;
+        let callback = author_description_callback(wrapper_topic_id, release_topic_id);
+        let reply_markup = remove_callback_button(reply_markup, &callback);
+        let delivery = if let Some(progress) = progress {
+            self.telegram
+                .edit_rich_message_or_text(
+                    progress,
+                    &rich_message.text,
+                    &fallback_text,
+                    reply_markup,
+                )
+                .await?
+        } else {
+            self.telegram
+                .send_rich_message_or_text(chat_id, &rich_message.text, &fallback_text, None)
+                .await?
+        };
+        let images = fallback_description_spoiler_images(
+            &image_sections,
+            delivery,
+            rich_message.embedded_spoiler_images,
+        );
+        self.send_description_spoiler_image_urls(chat_id, release.topic_id, &images)
+            .await;
+        Ok(())
+    }
+
+    async fn send_description_spoiler_image_urls(
+        &self,
+        chat_id: i64,
+        topic_id: u64,
+        images: &[String],
+    ) {
+        for image in images {
+            if let Err(err) = self
+                .telegram
+                .send_photo_url_or_upload(chat_id, image, None, None)
+                .await
+            {
+                warn!(
+                    topic_id,
+                    image,
+                    error = %err,
+                    "failed to send description spoiler image"
+                );
+            }
+        }
+    }
+
+    async fn rich_spoiler_image_sections(
+        &self,
+        sections: &[TopicSpoilerImages],
+    ) -> Vec<TopicSpoilerImages> {
+        let Some(public_base_url) = self.config.image_cache_public_base_url.as_deref() else {
+            return sections.to_vec();
+        };
+        let client = match image_cache::http_client() {
+            Ok(client) => client,
+            Err(err) => {
+                warn!(error = %err, "failed to initialize image cache HTTP client");
+                return Vec::new();
+            }
+        };
+        let mut remaining = TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT;
+        let mut cached_sections = Vec::new();
+        for section in sections {
+            if remaining == 0 {
+                break;
+            }
+            let mut images = Vec::new();
+            for image in section.images.iter().take(remaining) {
+                match image_cache::cache_remote_image(
+                    &client,
+                    &self.config.image_cache_dir,
+                    public_base_url,
+                    image,
+                )
+                .await
+                {
+                    Ok(cached_url) => images.push(cached_url),
+                    Err(err) => {
+                        warn!(image, error = %err, "failed to cache rich description image; sending spoiler images separately");
+                        return Vec::new();
+                    }
+                }
+            }
+            remaining = remaining.saturating_sub(images.len());
+            if !images.is_empty() {
+                cached_sections.push(TopicSpoilerImages {
+                    title: section.title.clone(),
+                    images,
+                });
+            }
+        }
+        cached_sections
     }
 
     fn topic_message_with_description(
@@ -1245,6 +1541,63 @@ impl App {
             downloads,
             description
         ))
+    }
+
+    fn topic_message_with_classic_description(
+        &self,
+        topic: &TopicDetails,
+        description: &str,
+    ) -> Result<String> {
+        if description.trim().is_empty() {
+            return self
+                .topic_message_with_description(topic, "Description is empty or unavailable.");
+        }
+        self.topic_message_with_description(
+            topic,
+            &format_description_html(&truncate_for_telegram(description, 3000)),
+        )
+    }
+
+    fn topic_message_with_rich_description(
+        &self,
+        topic: &TopicDetails,
+        description: &str,
+        image_sections: &[TopicSpoilerImages],
+    ) -> Result<RichDescriptionMessage> {
+        let total_images = spoiler_image_count(image_sections);
+        let max_images = total_images.min(TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT);
+        for embedded_images in (0..=max_images).rev() {
+            let embedded_sections = take_spoiler_image_sections(image_sections, embedded_images);
+            let mut low = 0;
+            let mut high = description.chars().count();
+            let mut best = None;
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let text = self.topic_message_with_description(
+                    topic,
+                    &rich_description_html(description, mid, &embedded_sections),
+                )?;
+                if rich_message_payload_char_count(&text) <= TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS
+                {
+                    best = Some(text);
+                    low = mid + 1;
+                } else if mid == 0 {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            if let Some(text) = best {
+                return Ok(RichDescriptionMessage {
+                    text,
+                    embedded_spoiler_images: embedded_images,
+                });
+            }
+        }
+        Ok(RichDescriptionMessage {
+            text: self.topic_message_with_classic_description(topic, description)?,
+            embedded_spoiler_images: 0,
+        })
     }
 
     fn category_link(
@@ -3104,6 +3457,270 @@ fn format_search_metadata_lines(result: &SearchResult) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+fn author_release_search_result(
+    fallback: &SearchResult,
+    release: &TopicDetails,
+    topic_url: String,
+    category_url: Option<String>,
+) -> SearchResult {
+    let mut result = fallback.clone();
+    result.topic_id = release.topic_id;
+    if !release.title.is_empty() {
+        result.title = release.title.clone();
+    }
+    result.topic_url = topic_url;
+    if let Some(category) = release.category_path.last().cloned() {
+        result.category = Some(category);
+        result.category_url = category_url;
+    }
+    if let Some(size) = release.total_size_bytes {
+        result.size_bytes = size;
+    }
+    if let Some(seeds) = release.seeds {
+        result.seeds = seeds;
+    }
+    if let Some(downloads) = release.downloads {
+        result.downloads = downloads;
+    }
+    if let Some(magnet) = release.magnet.as_ref() {
+        result.magnet = Some(magnet.clone());
+    }
+    if let Some(published) = release.publication_date.as_ref() {
+        result.published = Some(published.clone());
+    }
+    if let Some(author) = release.author.as_ref() {
+        result.author = Some(author.name.clone());
+        result.author_profile_url = author.profile_url.clone();
+    }
+    result
+}
+
+fn author_description_callback(wrapper_topic_id: u64, release_topic_id: u64) -> String {
+    format!("authdesc:{wrapper_topic_id}:{release_topic_id}")
+}
+
+fn parse_author_description_callback(value: &str) -> Option<(u64, u64)> {
+    let rest = value.strip_prefix("authdesc:")?;
+    let (wrapper_topic_id, release_topic_id) = rest.split_once(':')?;
+    Some((parse_u64(wrapper_topic_id)?, parse_u64(release_topic_id)?))
+}
+
+fn combined_author_description(wrapper: &TopicDetails, release: &TopicDetails) -> String {
+    let mut sections = Vec::new();
+    if !wrapper.description_text.trim().is_empty() {
+        sections.push(format!(
+            "== Author release page ==\n{}",
+            wrapper.description_text.trim()
+        ));
+    }
+    if !release.description_text.trim().is_empty() {
+        sections.push(format!(
+            "== Topic page ==\n{}",
+            release.description_text.trim()
+        ));
+    }
+    sections.join("\n\n")
+}
+
+fn combined_author_spoiler_image_sections(
+    wrapper: &TopicDetails,
+    release: &TopicDetails,
+) -> Vec<TopicSpoilerImages> {
+    wrapper
+        .first_post_spoiler_image_sections
+        .iter()
+        .chain(release.first_post_spoiler_image_sections.iter())
+        .cloned()
+        .collect()
+}
+
+fn fallback_description_spoiler_images(
+    sections: &[TopicSpoilerImages],
+    delivery: RichMessageDelivery,
+    embedded_images: usize,
+) -> Vec<String> {
+    let skip = match delivery {
+        RichMessageDelivery::Rich => embedded_images,
+        RichMessageDelivery::TextFallback => 0,
+    };
+    skip_spoiler_image_sections(sections, skip)
+}
+
+fn spoiler_image_count(sections: &[TopicSpoilerImages]) -> usize {
+    sections.iter().map(|section| section.images.len()).sum()
+}
+
+fn take_spoiler_image_sections(
+    sections: &[TopicSpoilerImages],
+    limit: usize,
+) -> Vec<TopicSpoilerImages> {
+    let mut remaining = limit;
+    let mut out = Vec::new();
+    for section in sections {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(section.images.len());
+        if take > 0 {
+            out.push(TopicSpoilerImages {
+                title: section.title.clone(),
+                images: section.images.iter().take(take).cloned().collect(),
+            });
+            remaining -= take;
+        }
+    }
+    out
+}
+
+fn skip_spoiler_image_sections(sections: &[TopicSpoilerImages], skip: usize) -> Vec<String> {
+    sections
+        .iter()
+        .flat_map(|section| section.images.iter())
+        .skip(skip)
+        .cloned()
+        .collect()
+}
+
+fn rich_description_html(
+    description: &str,
+    limit: usize,
+    image_sections: &[TopicSpoilerImages],
+) -> String {
+    let mut out = if description.trim().is_empty() {
+        "Description is empty or unavailable.".to_string()
+    } else {
+        format_description_html_with_rich_images(
+            &truncate_for_telegram(description, limit),
+            image_sections,
+        )
+    };
+    if description.trim().is_empty() {
+        let image_html = format_rich_spoiler_image_sections(image_sections);
+        if !out.ends_with("\n\n") {
+            if out.ends_with('\n') {
+                out.push('\n');
+            } else {
+                out.push_str("\n\n");
+            }
+        }
+        out.push_str(&image_html);
+    }
+    out
+}
+
+fn format_description_html_with_rich_images(
+    description: &str,
+    image_sections: &[TopicSpoilerImages],
+) -> String {
+    let lines = description.lines().collect::<Vec<_>>();
+    let mut used_sections = vec![false; image_sections.len()];
+    let mut out = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if let Some(title) = spoiler_title(lines[index]) {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                if out.ends_with('\n') {
+                    out.push('\n');
+                } else {
+                    out.push_str("\n\n");
+                }
+            }
+            out.push_str("<blockquote><b>");
+            out.push_str(&html_escape(title));
+            out.push_str("</b>");
+            index += 1;
+            while index < lines.len() {
+                if lines[index].trim().is_empty() || spoiler_title(lines[index]).is_some() {
+                    break;
+                }
+                out.push('\n');
+                out.push_str(&html_escape(lines[index]));
+                index += 1;
+            }
+            out.push_str("</blockquote>");
+            if let Some(section_index) =
+                matching_spoiler_image_section(image_sections, &used_sections, title)
+            {
+                used_sections[section_index] = true;
+                push_rich_spoiler_image_tags(&mut out, &image_sections[section_index].images);
+            }
+            while index < lines.len() && lines[index].trim().is_empty() {
+                index += 1;
+            }
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&html_escape(lines[index]));
+        index += 1;
+    }
+
+    // Image-only spoilers do not appear in description_text, so keep them as
+    // explicit media blocks after the textual description.
+    for (section_index, section) in image_sections.iter().enumerate() {
+        if used_sections[section_index] {
+            continue;
+        }
+        push_rich_spoiler_image_section(&mut out, section);
+    }
+    out
+}
+
+fn matching_spoiler_image_section(
+    sections: &[TopicSpoilerImages],
+    used_sections: &[bool],
+    title: &str,
+) -> Option<usize> {
+    let title = compact_spoiler_title(title);
+    sections
+        .iter()
+        .enumerate()
+        .find(|(index, section)| {
+            !used_sections[*index] && compact_spoiler_title(&section.title) == title
+        })
+        .map(|(index, _)| index)
+}
+
+fn compact_spoiler_title(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_rich_spoiler_image_sections(sections: &[TopicSpoilerImages]) -> String {
+    let mut out = String::new();
+    for section in sections {
+        push_rich_spoiler_image_section(&mut out, section);
+    }
+    out
+}
+
+fn push_rich_spoiler_image_section(out: &mut String, section: &TopicSpoilerImages) {
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    if !section.title.trim().is_empty() {
+        out.push_str("<blockquote><b>");
+        out.push_str(&html_escape(section.title.trim()));
+        out.push_str("</b></blockquote>");
+    }
+    push_rich_spoiler_image_tags(out, &section.images);
+}
+
+fn push_rich_spoiler_image_tags(out: &mut String, images: &[String]) {
+    for image in images {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("<img src=\"");
+        out.push_str(&html_escape(image));
+        out.push_str("\"/>");
+    }
+}
+
+fn rich_message_payload_char_count(value: &str) -> usize {
+    value.chars().map(|ch| if ch == '\n' { 4 } else { 1 }).sum()
+}
+
 fn format_description_html(description: &str) -> String {
     let lines = description.lines().collect::<Vec<_>>();
     let mut out = String::new();
@@ -3159,21 +3776,29 @@ mod tests {
 
     use crate::config::Config;
     use crate::downloader::SeedTorrentStats;
-    use crate::rutracker::{AuthorDetails, CategoryRef, RutrackerClient, TopicComment, TopicFile};
+    use crate::rutracker::{
+        AuthorDetails, CategoryRef, RutrackerClient, SearchResult, TopicComment, TopicFile,
+        TopicSpoilerImages,
+    };
     use crate::telegram::{
-        TELEGRAM_CAPTION_LIMIT_CHARS, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
+        RichMessageDelivery, TELEGRAM_CAPTION_LIMIT_CHARS, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS,
+        TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT, TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
     };
     use crate::torrent::TorrentFile;
 
     use super::{
         App, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, all_files_button_label,
-        author_name_link, callback_button, category_latest_callback, comments_next_keyboard,
-        comments_text, download_prompt_reply_markup, downloaded_file_caption,
-        files_from_topic_text, first_post_image_url, format_author, format_bytes,
-        format_description_html, format_topic_metadata_lines, help_text, inline_keyboard,
-        is_author_command, mark_update_seen, message_has_files_section, message_has_section,
-        now_seconds, parse_comments_callback, remove_callback_button, resolving_files_text,
-        seed_stats_text, selection_file_button_label, telegram_command_name, topic_title_link,
+        author_description_callback, author_name_link, author_release_search_result,
+        callback_button, category_latest_callback, combined_author_description,
+        comments_next_keyboard, comments_text, download_prompt_reply_markup,
+        downloaded_file_caption, fallback_description_spoiler_images, files_from_topic_text,
+        first_post_image_url, format_author, format_bytes, format_description_html,
+        format_rich_spoiler_image_sections, format_topic_metadata_lines, help_text,
+        image_cache_proxy_url, inline_keyboard, is_author_command, mark_update_seen,
+        message_has_files_section, message_has_section, now_seconds,
+        parse_author_description_callback, parse_comments_callback, remove_callback_button,
+        resolving_files_text, rich_message_payload_char_count, seed_stats_text,
+        selection_file_button_label, telegram_command_name, topic_title_link,
         verify_vm_worker_signature, vm_worker_signature,
     };
 
@@ -3192,6 +3817,8 @@ mod tests {
             http_timeout_seconds: 1,
             http_max_attempts: 1,
             tmp_dir: PathBuf::from("/tmp"),
+            image_cache_public_base_url: None,
+            image_cache_dir: PathBuf::from("/tmp/image-cache"),
             max_file_mb: 50,
             lambda_timeout_seconds: 900,
             download_margin_seconds: 20,
@@ -3238,6 +3865,97 @@ mod tests {
         );
         assert!(is_author_command("/author"));
         assert_eq!(telegram_command_name("hello"), None);
+    }
+
+    #[test]
+    fn parses_author_description_callbacks() {
+        let callback = author_description_callback(6860489, 6844147);
+
+        assert_eq!(callback, "authdesc:6860489:6844147");
+        assert_eq!(
+            parse_author_description_callback(&callback),
+            Some((6860489, 6844147))
+        );
+        assert_eq!(parse_author_description_callback("authdesc:6860489"), None);
+        assert_eq!(parse_author_description_callback("desc:6860489"), None);
+    }
+
+    #[test]
+    fn author_release_result_uses_linked_topic_metadata() {
+        let fallback = SearchResult {
+            topic_id: 6860489,
+            title: "ROOKAVA wrapper".to_string(),
+            author: Some("hagnir".to_string()),
+            author_profile_url: None,
+            category: Some(CategoryRef {
+                id: 1538,
+                name: "Авторские раздачи".to_string(),
+            }),
+            size_bytes: 0,
+            seeds: 0,
+            downloads: 0,
+            topic_url: "https://rutracker.org/forum/viewtopic.php?t=6860489".to_string(),
+            category_url: Some("https://rutracker.org/forum/viewforum.php?f=1538".to_string()),
+            magnet: None,
+            published: None,
+            local_catalog: false,
+        };
+        let release = TopicDetails {
+            topic_id: 6844147,
+            title: "ROOKAVA - 9 singles [FLAC]".to_string(),
+            author: Some(AuthorDetails {
+                name: "Аndy".to_string(),
+                profile_url: Some(
+                    "https://rutracker.org/forum/profile.php?mode=viewprofile&u=4474847"
+                        .to_string(),
+                ),
+                posts_count: None,
+                avatar_url: None,
+            }),
+            category_path: vec![CategoryRef {
+                id: 1825,
+                name: "lossless".to_string(),
+            }],
+            total_size_bytes: Some(308_176_486),
+            seeds: Some(7),
+            downloads: Some(42),
+            magnet: Some("magnet:?xt=urn:btih:test".to_string()),
+            publication_date: Some("2026-april-11".to_string()),
+            ..TopicDetails::default()
+        };
+
+        let result = author_release_search_result(
+            &fallback,
+            &release,
+            "https://rutracker.org/forum/viewtopic.php?t=6844147".to_string(),
+            Some("https://rutracker.org/forum/viewforum.php?f=1825".to_string()),
+        );
+
+        assert_eq!(result.topic_id, 6844147);
+        assert_eq!(result.title, "ROOKAVA - 9 singles [FLAC]");
+        assert_eq!(result.author.as_deref(), Some("Аndy"));
+        assert_eq!(result.category.as_ref().unwrap().id, 1825);
+        assert_eq!(result.size_bytes, 308_176_486);
+        assert_eq!(result.seeds, 7);
+        assert_eq!(result.downloads, 42);
+        assert_eq!(result.magnet.as_deref(), Some("magnet:?xt=urn:btih:test"));
+    }
+
+    #[test]
+    fn combines_author_wrapper_and_release_descriptions() {
+        let wrapper = TopicDetails {
+            description_text: "Wrapper text from author releases.".to_string(),
+            ..TopicDetails::default()
+        };
+        let release = TopicDetails {
+            description_text: "Release topic text.".to_string(),
+            ..TopicDetails::default()
+        };
+
+        assert_eq!(
+            combined_author_description(&wrapper, &release),
+            "== Author release page ==\nWrapper text from author releases.\n\n== Topic page ==\nRelease topic text."
+        );
     }
 
     #[test]
@@ -3626,6 +4344,197 @@ mod tests {
     }
 
     #[test]
+    fn rich_description_message_can_exceed_classic_message_limit() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Long Album".to_string(),
+            category_path: vec![CategoryRef {
+                id: 23,
+                name: "Music".to_string(),
+            }],
+            total_size_bytes: Some(1024),
+            seeds: Some(1),
+            downloads: Some(2),
+            ..TopicDetails::default()
+        };
+        let description = "Long description line.\n".repeat(350);
+
+        let text = app
+            .topic_message_with_rich_description(&topic, &description, &[])
+            .unwrap()
+            .text;
+
+        assert!(text.chars().count() > TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(text.chars().count() <= TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(rich_message_payload_char_count(&text) <= TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS);
+        assert!(text.contains("Long description line."));
+    }
+
+    #[test]
+    fn rich_description_embeds_spoiler_images() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            first_post_spoiler_image_sections: vec![TopicSpoilerImages {
+                title: "2026 - Single".to_string(),
+                images: vec![
+                    "https://img.example/cover.jpg".to_string(),
+                    "https://img.example/back.jpg?x=1&y=2".to_string(),
+                ],
+            }],
+            ..TopicDetails::default()
+        };
+
+        let message = app
+            .topic_message_with_rich_description(
+                &topic,
+                "Album description.",
+                &topic.first_post_spoiler_image_sections,
+            )
+            .unwrap();
+
+        assert_eq!(message.embedded_spoiler_images, 2);
+        assert!(
+            message
+                .text
+                .contains("<blockquote><b>2026 - Single</b></blockquote>")
+        );
+        assert!(
+            message
+                .text
+                .contains("<img src=\"https://img.example/cover.jpg\"/>")
+        );
+        assert!(
+            message
+                .text
+                .contains("<img src=\"https://img.example/back.jpg?x=1&amp;y=2\"/>")
+        );
+    }
+
+    #[test]
+    fn rich_description_places_spoiler_images_after_matching_text() {
+        let app = test_app();
+        let sections = vec![
+            TopicSpoilerImages {
+                title: "2026 - Лиса".to_string(),
+                images: vec!["https://img.example/lisa.jpg".to_string()],
+            },
+            TopicSpoilerImages {
+                title: "2026 - Волк".to_string(),
+                images: vec!["https://img.example/wolf.jpg".to_string()],
+            },
+        ];
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "ROOKAVA".to_string(),
+            first_post_spoiler_image_sections: sections.clone(),
+            ..TopicDetails::default()
+        };
+        let description = concat!(
+            "== 2026 - Лиса ==\n",
+            "ROOKAVA - Лиса [5:05]\n",
+            "Слияние электроники, фолка и загадки.\n\n",
+            "== 2026 - Волк ==\n",
+            "ROOKAVA - Волк [4:42]\n",
+            "Темный фолк-техно трек."
+        );
+
+        let message = app
+            .topic_message_with_rich_description(&topic, description, &sections)
+            .unwrap();
+
+        let lisa_text = message.text.find("ROOKAVA - Лиса").unwrap();
+        let lisa_image = message
+            .text
+            .find("<img src=\"https://img.example/lisa.jpg\"/>")
+            .unwrap();
+        let wolf_text = message.text.find("ROOKAVA - Волк").unwrap();
+        let wolf_image = message
+            .text
+            .find("<img src=\"https://img.example/wolf.jpg\"/>")
+            .unwrap();
+
+        assert!(lisa_text < lisa_image);
+        assert!(lisa_image < wolf_text);
+        assert!(wolf_text < wolf_image);
+        assert_eq!(message.embedded_spoiler_images, 2);
+    }
+
+    #[test]
+    fn formats_rich_spoiler_images_as_separate_media_blocks() {
+        let sections = vec![TopicSpoilerImages {
+            title: "Scans & Covers".to_string(),
+            images: vec![
+                "https://img.example/cover.jpg?x=1&y=2".to_string(),
+                "https://img.example/back.jpg".to_string(),
+            ],
+        }];
+
+        assert_eq!(
+            format_rich_spoiler_image_sections(&sections),
+            "<blockquote><b>Scans &amp; Covers</b></blockquote>\n<img src=\"https://img.example/cover.jpg?x=1&amp;y=2\"/>\n<img src=\"https://img.example/back.jpg\"/>"
+        );
+    }
+
+    #[test]
+    fn rich_description_sends_remaining_spoiler_images_separately() {
+        let app = test_app();
+        let sections = vec![TopicSpoilerImages {
+            title: "Albums".to_string(),
+            images: (0..(TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT + 2))
+                .map(|index| format!("https://img.example/{index}.jpg"))
+                .collect(),
+        }];
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            first_post_spoiler_image_sections: sections.clone(),
+            ..TopicDetails::default()
+        };
+
+        let message = app
+            .topic_message_with_rich_description(&topic, "Album description.", &sections)
+            .unwrap();
+
+        assert_eq!(
+            message.embedded_spoiler_images,
+            TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT
+        );
+        assert!(
+            message
+                .text
+                .contains("<img src=\"https://img.example/49.jpg\"/>")
+        );
+        assert!(
+            !message
+                .text
+                .contains("<img src=\"https://img.example/50.jpg\"/>")
+        );
+        assert_eq!(
+            fallback_description_spoiler_images(
+                &sections,
+                RichMessageDelivery::Rich,
+                message.embedded_spoiler_images,
+            ),
+            vec![
+                "https://img.example/50.jpg".to_string(),
+                "https://img.example/51.jpg".to_string(),
+            ]
+        );
+        assert_eq!(
+            fallback_description_spoiler_images(
+                &sections,
+                RichMessageDelivery::TextFallback,
+                message.embedded_spoiler_images,
+            )
+            .len(),
+            TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT + 2
+        );
+    }
+
+    #[test]
     fn formats_comments_text() {
         let topic = TopicDetails {
             comments_page: 2,
@@ -3807,6 +4716,17 @@ mod tests {
         verify_vm_worker_signature("secret", &timestamp, &signature, payload).unwrap();
         assert!(verify_vm_worker_signature("other", &timestamp, &signature, payload).is_err());
         assert!(verify_vm_worker_signature("secret", &timestamp, "sha256=bad", payload).is_err());
+    }
+
+    #[test]
+    fn builds_image_cache_proxy_url_from_vm_worker_url() {
+        let file_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg";
+
+        assert_eq!(
+            image_cache_proxy_url("http://203.0.113.10:8080/telegram", file_name).unwrap(),
+            "http://203.0.113.10:8080/image-cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg"
+        );
+        assert!(image_cache_proxy_url("http://203.0.113.10:8080/telegram", "../bad.jpg").is_err());
     }
 
     #[test]

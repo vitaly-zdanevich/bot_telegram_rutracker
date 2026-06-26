@@ -20,6 +20,8 @@ locals {
     telegram_webhook_secret                    = jsonencode(var.telegram_webhook_secret)
     allowed_telegram_user_ids                  = jsonencode(var.allowed_telegram_user_ids)
     rutracker_base_urls                        = jsonencode(var.rutracker_base_urls)
+    image_cache_public_base_url                = jsonencode(var.image_cache_public_base_url)
+    image_cache_dir                            = jsonencode(var.image_cache_dir)
     rutracker_username                         = jsonencode(var.rutracker_username)
     rutracker_password                         = jsonencode(var.rutracker_password)
     rutracker_cookie                           = jsonencode(var.rutracker_cookie)
@@ -94,6 +96,16 @@ resource "oci_core_security_list" "bot" {
 
   ingress_security_rules {
     protocol = "6"
+    source   = var.vm_worker_ingress_cidr
+
+    tcp_options {
+      min = 80
+      max = 80
+    }
+  }
+
+  ingress_security_rules {
+    protocol = "6"
     source   = var.torrent_ingress_cidr
 
     tcp_options {
@@ -155,6 +167,8 @@ resource "oci_core_instance" "bot" {
       telegram_webhook_secret                    = local.env.telegram_webhook_secret
       allowed_telegram_user_ids                  = local.env.allowed_telegram_user_ids
       rutracker_base_urls                        = local.env.rutracker_base_urls
+      image_cache_public_base_url                = local.env.image_cache_public_base_url
+      image_cache_dir                            = local.env.image_cache_dir
       rutracker_username                         = local.env.rutracker_username
       rutracker_password                         = local.env.rutracker_password
       rutracker_cookie                           = local.env.rutracker_cookie

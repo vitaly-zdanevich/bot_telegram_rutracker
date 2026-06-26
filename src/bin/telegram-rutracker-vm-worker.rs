@@ -1,13 +1,16 @@
 use anyhow::Result;
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use std::path::PathBuf;
 use telegram_rutracker_bot::app::{handle_vm_worker_payload, validate_vm_worker_payload};
 use telegram_rutracker_bot::config::{Config, optional_env};
 use telegram_rutracker_bot::downloader::{SeedConfig, TorrentDownloader};
+use telegram_rutracker_bot::image_cache;
 use tracing::{error, info, warn};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -16,7 +19,9 @@ const VM_WORKER_SIGNATURE_HEADER: &str = "x-telegram-rutracker-signature";
 const VM_WORKER_TIMESTAMP_HEADER: &str = "x-telegram-rutracker-timestamp";
 
 #[derive(Clone)]
-struct WorkerState;
+struct WorkerState {
+    image_cache_dir: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,22 +33,26 @@ async fn main() -> Result<()> {
         .without_time()
         .init();
 
-    initialize_seed_session_if_configured().await?;
+    let config = Config::from_env()?;
+    initialize_seed_session_if_configured(&config).await?;
 
     let bind = optional_env(VM_WORKER_BIND_ENV).unwrap_or_else(|| DEFAULT_BIND.to_string());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let state = WorkerState {
+        image_cache_dir: config.image_cache_dir,
+    };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/image-cache/{file}", get(image_cache_file))
         .route("/telegram", post(telegram_update))
-        .with_state(WorkerState);
+        .with_state(state);
 
     tracing::info!(bind, "starting VM worker HTTP server");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn initialize_seed_session_if_configured() -> Result<()> {
-    let config = Config::from_env()?;
+async fn initialize_seed_session_if_configured(config: &Config) -> Result<()> {
     if !config.seed_torrents {
         return Ok(());
     }
@@ -68,6 +77,24 @@ async fn initialize_seed_session_if_configured() -> Result<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn image_cache_file(State(state): State<WorkerState>, Path(file): Path<String>) -> Response {
+    match image_cache::read_cached_image(&state.image_cache_dir, &file).await {
+        Ok(image) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, image.content_type)
+            .header(CACHE_CONTROL, "public, max-age=2592000, immutable")
+            .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
+            .body(Body::from(image.bytes))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }),
+        Err(err) => {
+            warn!(file, error = %err, "failed to read cached image");
+            (StatusCode::NOT_FOUND, "not found").into_response()
+        }
+    }
 }
 
 async fn telegram_update(

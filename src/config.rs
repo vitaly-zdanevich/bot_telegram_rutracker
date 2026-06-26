@@ -39,6 +39,8 @@ pub struct Config {
     pub http_timeout_seconds: u64,
     pub http_max_attempts: usize,
     pub tmp_dir: PathBuf,
+    pub image_cache_public_base_url: Option<String>,
+    pub image_cache_dir: PathBuf,
     pub max_file_mb: u64,
     pub lambda_timeout_seconds: u64,
     pub download_margin_seconds: u64,
@@ -59,6 +61,11 @@ impl Config {
             optional_env("RUTRACKER_PASSWORD"),
         )?;
 
+        let tmp_dir = PathBuf::from(optional_env("TMP_DIR").unwrap_or_else(|| "/tmp".to_string()));
+        let image_cache_dir = optional_env("IMAGE_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| tmp_dir.join("image-cache"));
+
         Ok(Self {
             telegram_bot_token: required_env("TELEGRAM_BOT_TOKEN")?,
             telegram_api_base_url: parse_telegram_api_base_url(
@@ -77,7 +84,11 @@ impl Config {
             )?,
             http_max_attempts: parse_env("RUTRACKER_HTTP_MAX_ATTEMPTS", DEFAULT_HTTP_MAX_ATTEMPTS)?
                 .clamp(1, 10),
-            tmp_dir: PathBuf::from(optional_env("TMP_DIR").unwrap_or_else(|| "/tmp".to_string())),
+            tmp_dir,
+            image_cache_public_base_url: parse_image_cache_public_base_url(
+                optional_env("IMAGE_CACHE_PUBLIC_BASE_URL").as_deref(),
+            )?,
+            image_cache_dir,
             max_file_mb: parse_env("MAX_FILE_MB", TELEGRAM_MAX_FILE_MB_DEFAULT)?,
             lambda_timeout_seconds: parse_env(
                 "LAMBDA_TIMEOUT_SECONDS",
@@ -214,6 +225,18 @@ pub fn parse_telegram_api_base_url(value: Option<&str>) -> Result<String> {
     }
 }
 
+pub fn parse_image_cache_public_base_url(value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = url::Url::parse(value)
+        .with_context(|| format!("IMAGE_CACHE_PUBLIC_BASE_URL has invalid URL {value:?}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(Some(value.trim_end_matches('/').to_string())),
+        scheme => bail!("IMAGE_CACHE_PUBLIC_BASE_URL must use http or https, got {scheme:?}"),
+    }
+}
+
 pub fn parse_telegram_user_id_set(value: Option<&str>) -> Result<HashSet<i64>> {
     let Some(value) = value else {
         return Ok(HashSet::new());
@@ -240,8 +263,8 @@ pub fn parse_telegram_user_id_set(value: Option<&str>) -> Result<HashSet<i64>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_rutracker_base_url_list, parse_rutracker_credentials, parse_telegram_api_base_url,
-        parse_telegram_user_id_set,
+        parse_image_cache_public_base_url, parse_rutracker_base_url_list,
+        parse_rutracker_credentials, parse_telegram_api_base_url, parse_telegram_user_id_set,
     };
 
     #[test]
@@ -296,5 +319,15 @@ mod tests {
             "http://127.0.0.1:8081"
         );
         assert!(parse_telegram_api_base_url(Some("ftp://example.test")).is_err());
+    }
+
+    #[test]
+    fn parses_image_cache_public_base_url() {
+        assert_eq!(parse_image_cache_public_base_url(None).unwrap(), None);
+        assert_eq!(
+            parse_image_cache_public_base_url(Some("http://203.0.113.10:8080/")).unwrap(),
+            Some("http://203.0.113.10:8080".to_string())
+        );
+        assert!(parse_image_cache_public_base_url(Some("ftp://example.test")).is_err());
     }
 }

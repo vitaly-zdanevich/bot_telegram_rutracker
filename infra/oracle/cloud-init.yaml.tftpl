@@ -37,6 +37,8 @@ write_files:
       VM_WORKER_BIND="0.0.0.0:8080"
       ALLOWED_TELEGRAM_USER_IDS=${allowed_telegram_user_ids}
       RUTRACKER_BASE_URLS=${rutracker_base_urls}
+      IMAGE_CACHE_PUBLIC_BASE_URL=${image_cache_public_base_url}
+      IMAGE_CACHE_DIR=${image_cache_dir}
       RUTRACKER_USERNAME=${rutracker_username}
       RUTRACKER_PASSWORD=${rutracker_password}
       RUTRACKER_COOKIE=${rutracker_cookie}
@@ -61,7 +63,9 @@ write_files:
     content: |
       #!/usr/bin/env sh
       set -eu
+      iptables -C INPUT -p tcp -m tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 80 -j ACCEPT
       iptables -C INPUT -p tcp -m tcp --dport 8080 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 8080 -j ACCEPT
+      iptables -t nat -C PREROUTING -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 8080 2>/dev/null || iptables -t nat -I PREROUTING 1 -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 8080
       iptables -C INPUT -p tcp -m tcp --dport ${torrent_listen_port} -j ACCEPT 2>/dev/null || iptables -I INPUT 6 -p tcp -m tcp --dport ${torrent_listen_port} -j ACCEPT
       iptables -C INPUT -p udp -m udp --dport ${torrent_listen_port} -j ACCEPT 2>/dev/null || iptables -I INPUT 7 -p udp -m udp --dport ${torrent_listen_port} -j ACCEPT
   - path: /etc/systemd/system/telegram-bot-api.service
@@ -193,8 +197,10 @@ write_files:
       if ! id -u telegrambot >/dev/null 2>&1; then
         useradd --system --create-home --home-dir /var/lib/telegram-rutracker-bot --shell /usr/sbin/nologin telegrambot
       fi
-      install -d -m 0755 -o telegrambot -g telegrambot /var/lib/telegram-bot-api /var/lib/telegram-bot-api/tmp /var/lib/telegram-rutracker-bot /var/lib/telegram-rutracker-bot/tmp
+      install -d -m 0755 -o telegrambot -g telegrambot /var/lib/telegram-bot-api /var/lib/telegram-bot-api/tmp /var/lib/telegram-rutracker-bot /var/lib/telegram-rutracker-bot/tmp ${image_cache_dir}
+      iptables -C INPUT -p tcp -m tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 80 -j ACCEPT
       iptables -C INPUT -p tcp -m tcp --dport 8080 -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp -m tcp --dport 8080 -j ACCEPT
+      iptables -t nat -C PREROUTING -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 8080 2>/dev/null || iptables -t nat -I PREROUTING 1 -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 8080
 
       install -d -m 0755 /opt/rust/rustup /opt/rust/cargo
       export RUSTUP_HOME=/opt/rust/rustup

@@ -25,3 +25,4 @@ vm_worker_secret   = "replace-with-random-secret"
 
 allowed_telegram_user_ids = ""
 rutracker_base_urls       = "https://rutracker.org/forum,https://rutracker.net/forum,https://rutracker.nl/forum"
+image_cache_public_base_url = ""

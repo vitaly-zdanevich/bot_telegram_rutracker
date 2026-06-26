@@ -79,10 +79,19 @@ pub struct TopicDetails {
     pub description_text: String,
     pub description_html: String,
     pub first_post_images: Vec<String>,
+    pub first_post_spoiler_images: Vec<String>,
+    pub first_post_spoiler_image_sections: Vec<TopicSpoilerImages>,
+    pub first_post_topic_links: Vec<u64>,
     pub first_post_files: Vec<TopicFile>,
     pub comments: Vec<TopicComment>,
     pub comments_page: u32,
     pub comments_total_pages: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TopicSpoilerImages {
+    pub title: String,
+    pub images: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -565,6 +574,17 @@ fn compact_text(el: ElementRef<'_>) -> String {
 fn description_text(body: ElementRef<'_>) -> String {
     let mut out = String::new();
     for node in body.descendants() {
+        let empty_spoiler = ElementRef::wrap(node)
+            .filter(|element| element_has_class(element.value(), "sp-wrap"))
+            .or_else(|| {
+                node.ancestors()
+                    .filter_map(ElementRef::wrap)
+                    .find(|element| element_has_class(element.value(), "sp-wrap"))
+            })
+            .is_some_and(spoiler_has_no_text_body);
+        if empty_spoiler {
+            continue;
+        }
         match node.value() {
             Node::Text(value) => {
                 if let Some(spoiler_head) = node
@@ -607,6 +627,17 @@ fn description_text(body: ElementRef<'_>) -> String {
         }
     }
     normalize_description_text(&out)
+}
+
+fn spoiler_has_no_text_body(spoiler: ElementRef<'_>) -> bool {
+    let mut saw_body = false;
+    for body in spoiler.select(&selector(".sp-body")) {
+        saw_body = true;
+        if !text(body).is_empty() {
+            return false;
+        }
+    }
+    saw_body
 }
 
 fn is_description_block(name: &str) -> bool {
@@ -727,6 +758,83 @@ fn normalize_description_text(value: &str) -> String {
         normalized.pop();
     }
     normalized.join("\n")
+}
+
+fn remove_redundant_author_source(value: &str) -> String {
+    let same_line_pattern = Regex::new(r"(?i)(^|\s)источник\s*:\s*авторская\s+раздача\.?")
+        .expect("static regex is valid");
+    let source_lines = value
+        .lines()
+        .map(compact_description_line)
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    let mut lines = Vec::new();
+    while index < source_lines.len() {
+        let line = source_lines[index].as_str();
+        if line.is_empty() {
+            lines.push(String::new());
+            index += 1;
+            continue;
+        }
+        if is_author_extra_info_label(line)
+            && source_lines
+                .get(index + 1)
+                .is_some_and(|next| is_author_source_label(next))
+            && source_lines
+                .get(index + 2)
+                .is_some_and(|next| is_author_source_value(next))
+        {
+            index += 3;
+            continue;
+        }
+        if is_author_source_label(line)
+            && source_lines
+                .get(index + 1)
+                .is_some_and(|next| is_author_source_value(next))
+        {
+            index += 2;
+            continue;
+        }
+
+        let line_without_source = same_line_pattern.replace_all(line, "$1");
+        let removed_same_line_source = line_without_source.as_ref() != line;
+        let line = line_without_source.to_string();
+        if redundant_author_source_remainder(&line).is_empty()
+            || (removed_same_line_source && is_author_extra_info_label(&line))
+        {
+            index += 1;
+            continue;
+        }
+        lines.push(line);
+        index += 1;
+    }
+    normalize_description_text(&lines.join("\n"))
+}
+
+fn compact_description_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_author_source_label(value: &str) -> bool {
+    let value = redundant_author_source_remainder(value);
+    value == "источник"
+}
+
+fn is_author_source_value(value: &str) -> bool {
+    let value = redundant_author_source_remainder(value);
+    value == "авторская раздача"
+}
+
+fn is_author_extra_info_label(value: &str) -> bool {
+    let value = redundant_author_source_remainder(value);
+    matches!(value.as_str(), "доп информация" | "доп. информация")
+}
+
+fn redundant_author_source_remainder(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '-' | '—' | '.'))
+        .to_lowercase()
 }
 
 fn attr_url(base_url: &Url, value: &str) -> Option<String> {
@@ -1109,10 +1217,21 @@ pub fn parse_topic_page(
     let description_html = description_body
         .map(|body| body.inner_html())
         .unwrap_or_default();
-    let description_text = description_body.map(description_text).unwrap_or_default();
+    let mut description_text = description_body.map(description_text).unwrap_or_default();
     let release_type = extract_release_type(topic_post, description_body, &description_text);
+    if is_author_release_type(release_type.as_deref()) {
+        description_text = remove_redundant_author_source(&description_text);
+    }
     let first_post_images = description_body
         .map(|body| image_urls(body, base_url))
+        .unwrap_or_default();
+    let first_post_spoiler_image_sections = description_body
+        .map(|body| spoiler_image_sections(body, base_url))
+        .unwrap_or_default();
+    let first_post_spoiler_images =
+        spoiler_image_urls_from_sections(&first_post_spoiler_image_sections);
+    let first_post_topic_links = description_body
+        .map(|body| topic_link_ids(body, topic_id))
         .unwrap_or_default();
     let first_post_files = description_body
         .map(parse_first_post_files)
@@ -1125,10 +1244,7 @@ pub fn parse_topic_page(
         .select(&selector("a[href^=\"magnet:\"]"))
         .find_map(|a| a.value().attr("href").map(str::to_string));
     let total_size_bytes = extract_topic_size(&doc);
-    let seeds = doc
-        .select(&selector("#tor-seed-count, .seedmed"))
-        .next()
-        .and_then(|el| text(el).parse::<i64>().ok());
+    let seeds = extract_topic_seeds(&doc);
     let downloads = extract_topic_downloads(&doc);
     let comments = parse_comments_from_posts(&mut post_containers, base_url, comments_page == 1);
     let comments_total_pages = extract_topic_total_pages(&doc)
@@ -1150,6 +1266,9 @@ pub fn parse_topic_page(
         description_text,
         description_html,
         first_post_images,
+        first_post_spoiler_images,
+        first_post_spoiler_image_sections,
+        first_post_topic_links,
         first_post_files,
         comments,
         comments_page,
@@ -1334,17 +1453,26 @@ fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
     // RuTracker topics often use right-aligned post images as covers. Prefer
     // those for the topic card, while keeping the remaining images available.
     for image in body.select(&selector("var.postImg.img-right[title]")) {
+        if is_inside_spoiler(image) {
+            continue;
+        }
         let Some(src) = image.value().attr("title") else {
             continue;
         };
         let Some(url) = attr_url(base_url, src) else {
             continue;
         };
+        if is_rutracker_ui_image(&url) {
+            continue;
+        }
         if seen.insert(url.clone()) {
             urls.push(url);
         }
     }
     for img in body.select(&selector("img.img-right")) {
+        if is_inside_spoiler(img) {
+            continue;
+        }
         let Some(src) = img.value().attr("src") else {
             continue;
         };
@@ -1361,17 +1489,26 @@ fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
     // RuTracker renders some BBCode images as a var.postImg element whose
     // title contains the real image URL instead of using <img src=...>.
     for image in body.select(&selector("var.postImg[title]")) {
+        if is_inside_spoiler(image) {
+            continue;
+        }
         let Some(src) = image.value().attr("title") else {
             continue;
         };
         let Some(url) = attr_url(base_url, src) else {
             continue;
         };
+        if is_rutracker_ui_image(&url) {
+            continue;
+        }
         if seen.insert(url.clone()) {
             urls.push(url);
         }
     }
     for img in body.select(&selector("img")) {
+        if is_inside_spoiler(img) {
+            continue;
+        }
         let Some(src) = img.value().attr("src") else {
             continue;
         };
@@ -1385,7 +1522,98 @@ fn image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
             urls.push(url);
         }
     }
+    for spoiler in body.select(&selector(".sp-wrap")) {
+        for spoiler_body in spoiler.select(&selector(".sp-body")) {
+            push_post_image_urls(spoiler_body, base_url, &mut seen, &mut urls);
+        }
+    }
     urls
+}
+
+#[cfg(test)]
+fn spoiler_image_urls(body: ElementRef<'_>, base_url: &Url) -> Vec<String> {
+    spoiler_image_urls_from_sections(&spoiler_image_sections(body, base_url))
+}
+
+fn spoiler_image_sections(body: ElementRef<'_>, base_url: &Url) -> Vec<TopicSpoilerImages> {
+    let mut seen = HashSet::new();
+    let mut sections = Vec::new();
+    for spoiler in body.select(&selector(".sp-wrap")) {
+        let title = spoiler
+            .select(&selector(".sp-head"))
+            .next()
+            .map(compact_text)
+            .unwrap_or_default();
+        let mut images = Vec::new();
+        for spoiler_body in spoiler.select(&selector(".sp-body")) {
+            push_post_image_urls(spoiler_body, base_url, &mut seen, &mut images);
+        }
+        if !images.is_empty() {
+            sections.push(TopicSpoilerImages { title, images });
+        }
+    }
+    sections
+}
+
+fn spoiler_image_urls_from_sections(sections: &[TopicSpoilerImages]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for section in sections {
+        urls.extend(section.images.iter().cloned());
+    }
+    urls
+}
+
+fn topic_link_ids(body: ElementRef<'_>, current_topic_id: u64) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for link in body.select(&selector("a[href*=\"viewtopic.php?t=\"]")) {
+        let Some(id) = link
+            .value()
+            .attr("href")
+            .and_then(extract_topic_id_from_href)
+        else {
+            continue;
+        };
+        if id != current_topic_id && seen.insert(id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn push_post_image_urls(
+    body: ElementRef<'_>,
+    base_url: &Url,
+    seen: &mut HashSet<String>,
+    urls: &mut Vec<String>,
+) {
+    for element in body.descendants().filter_map(ElementRef::wrap) {
+        let src = match element.value().name() {
+            "var" if element_has_class(element.value(), "postImg") => element.value().attr("title"),
+            "img" => element.value().attr("src"),
+            _ => None,
+        };
+        if let Some(src) = src {
+            push_post_image_url(src, base_url, seen, urls);
+        }
+    }
+}
+
+fn push_post_image_url(
+    src: &str,
+    base_url: &Url,
+    seen: &mut HashSet<String>,
+    urls: &mut Vec<String>,
+) {
+    let Some(url) = attr_url(base_url, src) else {
+        return;
+    };
+    if is_rutracker_ui_image(&url) {
+        return;
+    }
+    if seen.insert(url.clone()) {
+        urls.push(url);
+    }
 }
 
 fn is_rutracker_ui_image(url: &str) -> bool {
@@ -1393,6 +1621,13 @@ fn is_rutracker_ui_image(url: &str) -> bool {
         || url.contains("static.rutracker.cc/smiles/")
         || url.contains("/templates/")
         || url.contains("/smiles/")
+}
+
+fn is_inside_spoiler(element: ElementRef<'_>) -> bool {
+    element
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .any(|ancestor| element_has_class(ancestor.value(), "sp-wrap"))
 }
 
 fn parse_author_near_body(body: ElementRef<'_>, base_url: &Url) -> Option<AuthorDetails> {
@@ -1664,6 +1899,21 @@ fn extract_topic_downloads(doc: &Html) -> Option<u64> {
         .or_else(|| parse_torrent_downloads_from_text(&text(doc.root_element())))
 }
 
+fn extract_topic_seeds(doc: &Html) -> Option<i64> {
+    doc.select(&selector(
+        "#tor-seed-count, .seed b, .seedmed b, b.seedmed, .seedmed",
+    ))
+    .find_map(|el| parse_human_i64(&text(el)))
+    .or_else(|| parse_topic_seeds_from_text(&text(doc.root_element())))
+}
+
+fn parse_topic_seeds_from_text(value: &str) -> Option<i64> {
+    let captures = Regex::new(r"(?i)(?:сиды|seeders?|seeds)\s*:?\s*([\d\s,]+)")
+        .ok()?
+        .captures(value)?;
+    parse_human_i64(captures.get(1)?.as_str())
+}
+
 fn parse_torrent_downloads_from_text(value: &str) -> Option<u64> {
     let captures = Regex::new(r"(?i)(?:\.torrent\s*)?скачан\s*:\s*([\d\s,]+)\s*раз")
         .ok()?
@@ -1693,6 +1943,10 @@ fn extract_release_type(
     description_body
         .is_some_and(has_author_release_marker)
         .then(|| "авторская".to_string())
+}
+
+fn is_author_release_type(release_type: Option<&str>) -> bool {
+    release_type.is_some_and(|value| value.trim().to_lowercase() == "авторская")
 }
 
 fn has_author_release_marker(body: ElementRef<'_>) -> bool {
@@ -1857,6 +2111,10 @@ fn month_name(value: &str) -> Option<&'static str> {
 
 fn parse_human_u64(value: &str) -> Option<u64> {
     value.replace([' ', ','], "").parse::<u64>().ok()
+}
+
+fn parse_human_i64(value: &str) -> Option<i64> {
+    value.replace([' ', ','], "").parse::<i64>().ok()
 }
 
 pub fn parse_forum_nodes(html: &str) -> Vec<ForumNode> {
@@ -2181,6 +2439,175 @@ mod tests {
     }
 
     #[test]
+    fn skips_image_only_description_spoilers() {
+        let html = r#"
+            <div class="post_body">
+                <p>Описание раздачи: городские фото.</p>
+                <div class="sp-wrap">
+                    <div class="sp-head folded"><span>Превью примеров</span></div>
+                    <div class="sp-body">
+                        <var class="postImg" title="https://static.rutracker.cc/smiles/tr_oops.gif"></var>
+                    </div>
+                </div>
+                <div class="sp-wrap">
+                    <div class="sp-head folded"><span>Превью рабочих примеров</span></div>
+                    <div class="sp-body">
+                        <var class="postImg" title="https://img.example/thumb.jpg"></var>
+                    </div>
+                </div>
+                <div class="sp-wrap">
+                    <div class="sp-head folded"><span>Скриншоты</span></div>
+                    <div class="sp-body">
+                        <img src="https://img.example/screenshot-one.jpg" alt="">
+                        <var class="postImg" title="https://img.example/screenshot-two.jpg"></var>
+                    </div>
+                </div>
+                <div class="sp-wrap">
+                    <div class="sp-head folded"><span>Дополнительно</span></div>
+                    <div class="sp-body">Источник: авторская съемка.</div>
+                </div>
+            </div>
+        "#;
+        let doc = Html::parse_fragment(html);
+        let body = doc.select(&selector(".post_body")).next().unwrap();
+        let text = description_text(body);
+
+        assert!(!text.contains("Превью примеров"));
+        assert!(!text.contains("Превью рабочих примеров"));
+        assert!(!text.contains("Скриншоты"));
+        assert!(text.contains("Описание раздачи: городские фото."));
+        assert!(text.contains("== Дополнительно ==\nИсточник: авторская съемка."));
+        assert_eq!(
+            spoiler_image_urls(body, &base()),
+            vec![
+                "https://img.example/thumb.jpg",
+                "https://img.example/screenshot-one.jpg",
+                "https://img.example/screenshot-two.jpg",
+            ]
+        );
+        assert_eq!(
+            spoiler_image_sections(body, &base()),
+            vec![
+                TopicSpoilerImages {
+                    title: "Превью рабочих примеров".to_string(),
+                    images: vec!["https://img.example/thumb.jpg".to_string()],
+                },
+                TopicSpoilerImages {
+                    title: "Скриншоты".to_string(),
+                    images: vec![
+                        "https://img.example/screenshot-one.jpg".to_string(),
+                        "https://img.example/screenshot-two.jpg".to_string(),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_first_post_topic_links() {
+        let html = r#"
+            <html>
+                <body>
+                    <h1 class="maintitle">Author release wrapper</h1>
+                    <div class="post_wrap">
+                        <div class="post_body">
+                            Качаем, слушаем:
+                            <a href="viewtopic.php?t=6844147" class="postLink">ROOKAVA - 9 singles</a>
+                            <a href="viewtopic.php?t=6860489" class="postLink">self</a>
+                            <a href="viewtopic.php?t=6844147" class="postLink">duplicate</a>
+                        </div>
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        let topic = parse_topic(html, 6860489, &base()).unwrap();
+
+        assert_eq!(topic.first_post_topic_links, vec![6844147]);
+    }
+
+    #[test]
+    fn parses_authenticated_topic_seed_count() {
+        let html = r#"
+            <html>
+                <body>
+                    <h1 class="maintitle">Legal Techno Release</h1>
+                    <span class="seed">Сиды:&nbsp; <b>13</b></span>
+                    <span class="leech">Личи:&nbsp; <b>1</b></span>
+                    <div class="post_wrap">
+                        <div class="post_body">Release text.</div>
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        let topic = parse_topic(html, 6844147, &base()).unwrap();
+
+        assert_eq!(topic.seeds, Some(13));
+    }
+
+    #[test]
+    fn removes_redundant_author_source_from_author_release_description() {
+        let html = r#"
+            <html>
+                <body>
+                    <h1 class="maintitle">Author Release</h1>
+                    <div class="post_wrap">
+                        <div class="post_body">
+                            <span class="post-b">Тип</span>: авторская<br>
+                            <span class="post-b">Источник</span>: <a href="https://example.invalid/artist">авторская раздача</a><br>
+                            <span class="post-b">Жанр</span>: Techno-Folk
+                        </div>
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        let topic = parse_topic(html, 42, &base()).unwrap();
+
+        assert_eq!(topic.release_type.as_deref(), Some("авторская"));
+        assert!(
+            !topic
+                .description_text
+                .contains("Источник: авторская раздача")
+        );
+        assert!(topic.description_text.contains("Тип: авторская"));
+        assert!(topic.description_text.contains("Жанр: Techno-Folk"));
+    }
+
+    #[test]
+    fn prefers_non_spoiler_image_before_spoiler_track_images() {
+        let html = r#"
+            <div class="post_body">
+                <span class="post-align">
+                    <var class="postImg" title="https://img.example/final-page-main.jpg"></var>
+                </span>
+                <div class="sp-wrap">
+                    <div class="sp-head folded"><span>2025 - Track</span></div>
+                    <div class="sp-body">
+                        <var class="postImg postImgAligned img-right" title="https://img.example/spoiler-track.jpg"></var>
+                        Track text.
+                    </div>
+                </div>
+                <span class="post-align">
+                    <var class="postImg" title="https://img.example/final-page-footer.jpg"></var>
+                </span>
+            </div>
+        "#;
+        let doc = Html::parse_fragment(html);
+        let body = doc.select(&selector(".post_body")).next().unwrap();
+
+        assert_eq!(
+            image_urls(body, &base()),
+            vec![
+                "https://img.example/final-page-main.jpg",
+                "https://img.example/final-page-footer.jpg",
+                "https://img.example/spoiler-track.jpg",
+            ]
+        );
+    }
+
+    #[test]
     fn prefers_right_aligned_first_post_image() {
         let html = r#"
             <div class="post_body">
@@ -2201,6 +2628,24 @@ mod tests {
                 "https://img.example/wiki-icon.png",
                 "https://rutracker.org/images/back.jpg",
             ]
+        );
+    }
+
+    #[test]
+    fn skips_broken_rutracker_image_placeholders() {
+        let html = r#"
+            <div class="post_body">
+                <var class="postImg postImgAligned img-right" title="https://static.rutracker.cc/smiles/tr_oops.gif"></var>
+                <var class="postImg" title="https://img.example/preview.jpg"></var>
+                <img src="https://static.rutracker.cc/smiles/tr_oops.gif" alt="">
+            </div>
+        "#;
+        let doc = Html::parse_fragment(html);
+        let body = doc.select(&selector(".post_body")).next().unwrap();
+
+        assert_eq!(
+            image_urls(body, &base()),
+            vec!["https://img.example/preview.jpg"]
         );
     }
 
