@@ -19,6 +19,7 @@ use crate::catalog::OfflineCatalog;
 use crate::config::Config;
 use crate::downloader::{
     DownloadOutcome, DownloadRequest, SeedConfig, SeedTorrentStats, TorrentDownloader,
+    magnet_from_topic_or_metadata,
 };
 use crate::image_cache;
 use crate::rutracker::{
@@ -2153,23 +2154,12 @@ impl App {
                 false,
             ),
         };
-        let magnet = match self.download_magnet(topic_id).await {
-            Ok(magnet) => magnet,
-            Err(err) => {
-                if preserve_message_body {
-                    self.send_rutracker_unavailable(chat_id, &err).await?;
-                } else {
-                    self.edit_rutracker_unavailable(progress, &err).await?;
-                }
-                return Ok(());
-            }
-        };
         let downloader = self.downloader(topic_id);
         let metadata = match self
-            .cached_metadata(topic_id, &magnet, &downloader, 120)
+            .cached_download_metadata(topic_id, &downloader, 120)
             .await
         {
-            Ok(metadata) => metadata,
+            Ok((_, metadata)) => metadata,
             Err(err) => {
                 let text = format!(
                     "Cannot load torrent metadata for selection: {}",
@@ -2300,10 +2290,10 @@ impl App {
         &self,
         selection: &DownloadSelection,
     ) -> Result<TorrentMetadata> {
-        let magnet = self.download_magnet(selection.topic_id).await?;
         let downloader = self.downloader(selection.topic_id);
-        self.cached_metadata(selection.topic_id, &magnet, &downloader, 120)
+        self.cached_download_metadata(selection.topic_id, &downloader, 120)
             .await
+            .map(|(_, metadata)| metadata)
     }
 
     async fn render_or_send_selection(
@@ -2403,28 +2393,12 @@ impl App {
             total_seconds,
         );
 
-        let magnet = match self.download_magnet(topic_id).await {
-            Ok(magnet) => magnet.to_string(),
-            Err(err) => {
-                countdown.stop();
-                typing.stop();
-                self.telegram
-                    .edit_message(
-                        progress,
-                        &format!("Cannot download: {}", html_escape(&err.to_string())),
-                        None,
-                    )
-                    .await?;
-                return Ok(());
-            }
-        };
-
         let downloader = self.downloader(topic_id);
-        let metadata = match self
-            .cached_metadata(topic_id, &magnet, &downloader, total_seconds.min(180))
+        let (magnet, metadata) = match self
+            .cached_download_metadata(topic_id, &downloader, total_seconds.min(180))
             .await
         {
-            Ok(metadata) => metadata,
+            Ok(value) => value,
             Err(err) => {
                 countdown.stop();
                 typing.stop();
@@ -2432,7 +2406,7 @@ impl App {
                     .edit_message(
                         progress,
                         &format!(
-                            "Failed to resolve magnet metadata: {}",
+                            "Failed to load torrent metadata: {}",
                             html_escape(&err.to_string())
                         ),
                         None,
@@ -2453,13 +2427,7 @@ impl App {
             )
             .await;
         let telegram = self.telegram.clone();
-        let (title, topic_url) = match self.cached_local_result(topic_id) {
-            Some(result) => (result.title, result.topic_url),
-            None => {
-                let topic = self.cached_topic(topic_id).await?;
-                (topic.title, self.rutracker.topic_url(topic_id)?)
-            }
-        };
+        let (title, topic_url) = self.download_source_title_url(topic_id, &metadata)?;
         let outcome = match downloader
             .download_small_files(
                 DownloadRequest {
@@ -2864,6 +2832,23 @@ impl App {
         Ok(value)
     }
 
+    async fn cached_download_metadata(
+        &self,
+        topic_id: u64,
+        downloader: &TorrentDownloader,
+        timeout_seconds: u64,
+    ) -> Result<(String, TorrentMetadata)> {
+        if let Some(metadata) = self.cached_seed_metadata(topic_id, downloader).await? {
+            let magnet = magnet_from_topic_or_metadata(None, &metadata)?;
+            return Ok((magnet, metadata));
+        }
+        let magnet = self.download_magnet(topic_id).await?;
+        let metadata = self
+            .cached_metadata(topic_id, &magnet, downloader, timeout_seconds)
+            .await?;
+        Ok((magnet, metadata))
+    }
+
     async fn cached_seed_metadata(
         &self,
         topic_id: u64,
@@ -2902,6 +2887,20 @@ impl App {
             &topic_id,
         )
     }
+
+    fn download_source_title_url(
+        &self,
+        topic_id: u64,
+        metadata: &TorrentMetadata,
+    ) -> Result<(String, String)> {
+        if let Some(result) = self.cached_local_result(topic_id) {
+            return Ok((result.title, result.topic_url));
+        }
+        if let Some(topic) = cached_topic_value(topic_id) {
+            return Ok((topic.title, self.rutracker.topic_url(topic_id)?));
+        }
+        Ok((metadata.name.clone(), self.rutracker.topic_url(topic_id)?))
+    }
 }
 
 fn cache_get<K, T>(cache: &Mutex<HashMap<K, CacheEntry<T>>>, key: &K) -> Option<T>
@@ -2934,6 +2933,13 @@ where
 fn cached_metadata_value(topic_id: u64) -> Option<TorrentMetadata> {
     cache_get(
         METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+        &topic_id,
+    )
+}
+
+fn cached_topic_value(topic_id: u64) -> Option<TopicDetails> {
+    cache_get(
+        TOPIC_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
         &topic_id,
     )
 }
@@ -4055,6 +4061,7 @@ mod tests {
         TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
     };
     use crate::torrent::{TorrentFile, TorrentMetadata};
+    use lava_torrent::torrent::v1::TorrentBuilder;
 
     use super::{
         App, DownloadPromptLimit, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails,
@@ -4372,6 +4379,82 @@ mod tests {
         assert!(text.contains("Title"));
         assert!(text.contains("new.flac"));
         assert!(!text.contains("old.flac"));
+    }
+
+    #[tokio::test]
+    async fn download_metadata_prefers_vm_seed_cache() {
+        let mut app = test_app();
+        let tmp = tempfile::tempdir().unwrap();
+        app.config.tmp_dir = tmp.path().to_path_buf();
+        app.config.seed_torrents = true;
+
+        let topic_id = 42;
+        let output_dir = app
+            .config
+            .tmp_dir
+            .join("seeds")
+            .join(format!("rutracker-{topic_id}"));
+        let session_dir = app.config.tmp_dir.join("seeds").join(".rqbit-session");
+        tokio::fs::create_dir_all(&output_dir).await.unwrap();
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let file_path = output_dir.join("track.flac");
+        tokio::fs::write(&file_path, vec![1_u8; 123]).await.unwrap();
+
+        let torrent_bytes = TorrentBuilder::new(file_path.to_str().unwrap(), 16_384)
+            .set_announce(Some("udp://tracker".to_string()))
+            .build()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let expected = crate::torrent::parse_torrent_bytes(torrent_bytes.clone()).unwrap();
+        tokio::fs::write(
+            session_dir.join(format!("{}.torrent", expected.info_hash)),
+            &torrent_bytes,
+        )
+        .await
+        .unwrap();
+        let session = serde_json::json!({
+            "torrents": {
+                "0": {
+                    "info_hash": expected.info_hash.clone(),
+                    "trackers": ["udp://tracker"],
+                    "output_folder": output_dir.to_string_lossy(),
+                    "only_files": [0],
+                    "is_paused": false
+                }
+            }
+        });
+        tokio::fs::write(session_dir.join("session.json"), session.to_string())
+            .await
+            .unwrap();
+
+        let downloader = app.downloader(topic_id);
+        let (magnet, metadata) = app
+            .cached_download_metadata(topic_id, &downloader, 120)
+            .await
+            .unwrap();
+
+        assert!(magnet.starts_with("magnet:?xt=urn:btih:"));
+        assert_eq!(metadata.info_hash, expected.info_hash);
+        assert_eq!(metadata.files.len(), 1);
+        assert_eq!(metadata.files[0].size_bytes, 123);
+    }
+
+    #[test]
+    fn download_source_uses_metadata_name_without_topic_cache() {
+        let app = test_app();
+        let metadata = TorrentMetadata {
+            name: "Seeded Album".to_string(),
+            info_hash: "abcdef".to_string(),
+            magnet: Some("magnet:?xt=urn:btih:abcdef".to_string()),
+            files: vec![],
+            torrent_bytes: None,
+        };
+
+        let (title, topic_url) = app.download_source_title_url(42, &metadata).unwrap();
+
+        assert_eq!(title, "Seeded Album");
+        assert_eq!(topic_url, "https://rutracker.org/forum/viewtopic.php?t=42");
     }
 
     #[test]
