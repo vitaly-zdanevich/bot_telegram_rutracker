@@ -85,6 +85,12 @@ pub struct Telegram {
     http: reqwest::Client,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlayableUploadKind {
+    Audio,
+    Video,
+}
+
 pub struct ChatActionHeartbeat {
     stop: Arc<AtomicBool>,
     task: JoinHandle<()>,
@@ -494,16 +500,72 @@ impl Telegram {
         display_name: &str,
         caption: Option<&str>,
     ) -> Result<()> {
+        self.send_multipart_file(
+            "sendDocument",
+            "document",
+            chat_id,
+            path,
+            display_name,
+            caption,
+        )
+        .await
+    }
+
+    pub async fn send_playable_or_document(
+        &self,
+        chat_id: i64,
+        path: &Path,
+        display_name: &str,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        let Some(kind) = playable_upload_kind(path, display_name) else {
+            return self
+                .send_document(chat_id, path, display_name, caption)
+                .await;
+        };
+        let (method, field) = match kind {
+            PlayableUploadKind::Audio => ("sendAudio", "audio"),
+            PlayableUploadKind::Video => ("sendVideo", "video"),
+        };
+        let media_error = match self
+            .send_multipart_file(method, field, chat_id, path, display_name, caption)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        warn!(
+            display_name,
+            method,
+            error = %media_error,
+            "Telegram rejected playable media upload; sending as document"
+        );
+        self.send_document(chat_id, path, display_name, caption)
+            .await
+            .with_context(|| {
+                format!(
+                    "Telegram rejected {method} upload ({media_error}); document fallback failed"
+                )
+            })
+    }
+
+    async fn send_multipart_file(
+        &self,
+        method: &str,
+        file_field: &str,
+        chat_id: i64,
+        path: &Path,
+        display_name: &str,
+        caption: Option<&str>,
+    ) -> Result<()> {
         let file = tokio::fs::File::open(path)
             .await
             .with_context(|| format!("failed to open {}", path.display()))?;
         let stream = FramedRead::new(file, BytesCodec::new());
         let body = reqwest::Body::wrap_stream(stream);
-        let mime = mime_guess::from_path(path)
-            .first_raw()
-            .unwrap_or("application/octet-stream");
+        let mime = upload_mime(path, display_name);
         let mut form = Form::new().text("chat_id", chat_id.to_string()).part(
-            "document",
+            file_field.to_string(),
             Part::stream(body)
                 .file_name(display_name.to_string())
                 .mime_str(mime)?,
@@ -518,18 +580,12 @@ impl Telegram {
         }
         let response = self
             .http
-            .post(self.method_url("sendDocument"))
+            .post(self.method_url(method))
             .multipart(form)
             .send()
             .await
-            .map_err(|err| {
-                anyhow!(
-                    "Telegram sendDocument request failed: {}",
-                    err.without_url()
-                )
-            })?;
-        self.telegram_status_response("sendDocument", response)
-            .await?;
+            .map_err(|err| anyhow!("Telegram {method} request failed: {}", err.without_url()))?;
+        self.telegram_status_response(method, response).await?;
         Ok(())
     }
 
@@ -884,6 +940,42 @@ fn image_mime_for_upload(content_type: Option<&str>, file_name: &str) -> Result<
         .ok_or_else(|| anyhow!("downloaded URL has no image content type"))
 }
 
+fn upload_mime(path: &Path, display_name: &str) -> &'static str {
+    mime_guess::from_path(display_name)
+        .first_raw()
+        .or_else(|| mime_guess::from_path(path).first_raw())
+        .unwrap_or("application/octet-stream")
+}
+
+fn playable_upload_kind(path: &Path, display_name: &str) -> Option<PlayableUploadKind> {
+    let mime = upload_mime(path, display_name);
+    if mime.starts_with("audio/") {
+        return Some(PlayableUploadKind::Audio);
+    }
+    if mime.starts_with("video/") {
+        return Some(PlayableUploadKind::Video);
+    }
+
+    // Telegram accepts a narrower set for playable uploads than MIME databases
+    // can describe, so still try known media extensions and keep document fallback.
+    let extension = upload_extension(path, display_name)?;
+    match extension.as_str() {
+        "aac" | "aiff" | "alac" | "ape" | "flac" | "m4a" | "mp3" | "oga" | "ogg" | "opus"
+        | "wav" | "wma" | "wv" => Some(PlayableUploadKind::Audio),
+        "avi" | "flv" | "m2ts" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "ts" | "webm"
+        | "wmv" => Some(PlayableUploadKind::Video),
+        _ => None,
+    }
+}
+
+fn upload_extension(path: &Path, display_name: &str) -> Option<String> {
+    Path::new(display_name)
+        .extension()
+        .or_else(|| path.extension())
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
 pub fn countdown_status_text(prefix: &str, label: &str, minutes_left: u64) -> String {
     format!(
         "{prefix}\n{label}: {} left",
@@ -942,9 +1034,12 @@ pub fn copy_button(text: &str, copy_text: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
-        TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram, countdown_status_text, first_media_src,
-        first_media_tag_start, log_context_around, rich_message_html,
+        PlayableUploadKind, TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
+        countdown_status_text, first_media_src, first_media_tag_start, log_context_around,
+        playable_upload_kind, rich_message_html,
     };
 
     #[test]
@@ -977,6 +1072,34 @@ mod tests {
         assert_eq!(
             telegram.method_url("sendDocument"),
             "http://127.0.0.1:8081/bottoken/sendDocument"
+        );
+    }
+
+    #[test]
+    fn detects_playable_upload_kind_from_display_name() {
+        assert_eq!(
+            playable_upload_kind(Path::new("/tmp/download"), "Album/track.FLAC"),
+            Some(PlayableUploadKind::Audio)
+        );
+        assert_eq!(
+            playable_upload_kind(Path::new("/tmp/download"), "clip.mp4"),
+            Some(PlayableUploadKind::Video)
+        );
+        assert_eq!(
+            playable_upload_kind(Path::new("/tmp/download"), "book.pdf"),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_playable_upload_kind_from_download_path() {
+        assert_eq!(
+            playable_upload_kind(Path::new("/tmp/track.ogg"), "download"),
+            Some(PlayableUploadKind::Audio)
+        );
+        assert_eq!(
+            playable_upload_kind(Path::new("/tmp/movie.mkv"), "download"),
+            Some(PlayableUploadKind::Video)
         );
     }
 

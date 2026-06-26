@@ -91,6 +91,13 @@ struct RichDescriptionMessage {
     embedded_spoiler_images: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownloadPromptLimit {
+    Unknown,
+    AllFilesFit,
+    SomeFilesOversized,
+}
+
 pub async fn webhook_handler(request: Request) -> Result<impl IntoResponse, Error> {
     if is_image_cache_proxy_request(&request) {
         return Ok(proxy_image_cache_request(&request).await?);
@@ -1815,6 +1822,8 @@ impl App {
         reply_markup: Option<Value>,
         current_text: Option<String>,
     ) -> Result<()> {
+        let preserve_message_body =
+            should_preserve_callback_message_body(progress, current_text.as_deref());
         if let Some(local_result) = self.cached_local_result(topic_id) {
             return self
                 .handle_local_download_prompt(
@@ -1823,6 +1832,7 @@ impl App {
                     progress,
                     reply_markup,
                     local_result,
+                    preserve_message_body,
                 )
                 .await;
         }
@@ -1839,14 +1849,22 @@ impl App {
         };
         let include_description = message_has_section(current_text.as_deref(), "Description");
         let existing_files = self.existing_files_section(&topic, current_text.as_deref());
+        let prompt_limit = topic_download_prompt_limit(&topic, self.config.max_file_mb);
         let text = self.topic_message_with_download_prompt(
             &topic,
             include_description,
             existing_files.as_deref(),
+            prompt_limit,
         )?;
         let all_files_label = all_files_button_label(&topic, self.config.max_file_mb);
         let reply_markup = download_prompt_reply_markup(reply_markup, topic_id, &all_files_label);
         if let Some(progress) = progress {
+            if preserve_message_body {
+                return self
+                    .telegram
+                    .edit_message_reply_markup(progress, reply_markup)
+                    .await;
+            }
             match self
                 .telegram
                 .edit_message(progress, &text, reply_markup.clone())
@@ -1866,7 +1884,7 @@ impl App {
                         .send_message_reply_to(
                             chat_id,
                             progress.message_id,
-                            &download_prompt_text(self.config.max_file_mb),
+                            &download_prompt_text(self.config.max_file_mb, prompt_limit),
                             None,
                         )
                         .await
@@ -1887,6 +1905,7 @@ impl App {
         progress: Option<ProgressMessage>,
         reply_markup: Option<Value>,
         result: SearchResult,
+        preserve_message_body: bool,
     ) -> Result<()> {
         let Some(magnet) = result.magnet.as_deref() else {
             self.telegram
@@ -1921,8 +1940,15 @@ impl App {
         };
         let all_files_label =
             all_files_button_label_from_metadata(&metadata, self.config.max_file_mb);
+        let prompt_limit = metadata_download_prompt_limit(&metadata, self.config.max_file_mb);
         let reply_markup = download_prompt_reply_markup(reply_markup, topic_id, &all_files_label);
         if let Some(progress) = progress {
+            if preserve_message_body {
+                return self
+                    .telegram
+                    .edit_message_reply_markup(progress, reply_markup)
+                    .await;
+            }
             self.telegram
                 .edit_message_reply_markup(progress, reply_markup)
                 .await?;
@@ -1930,7 +1956,7 @@ impl App {
                 .send_message_reply_to(
                     chat_id,
                     progress.message_id,
-                    &download_prompt_text(self.config.max_file_mb),
+                    &download_prompt_text(self.config.max_file_mb, prompt_limit),
                     None,
                 )
                 .await
@@ -1939,7 +1965,7 @@ impl App {
             self.telegram
                 .send_message(
                     chat_id,
-                    &download_prompt_text(self.config.max_file_mb),
+                    &download_prompt_text(self.config.max_file_mb, prompt_limit),
                     reply_markup,
                 )
                 .await
@@ -1951,6 +1977,7 @@ impl App {
         topic: &TopicDetails,
         include_description: bool,
         existing_files: Option<&str>,
+        prompt_limit: DownloadPromptLimit,
     ) -> Result<String> {
         let mut text = if include_description && !topic.description_text.is_empty() {
             self.topic_message_with_description(
@@ -1961,14 +1988,14 @@ impl App {
             self.topic_message_header(topic)?
         };
         if let Some(existing_files) = existing_files {
-            let download_prompt = download_prompt_text(self.config.max_file_mb);
+            let download_prompt = download_prompt_text(self.config.max_file_mb, prompt_limit);
             let with_files = format!("{text}\n\n{existing_files}\n\n{download_prompt}");
             if with_files.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
                 return Ok(with_files);
             }
         }
         text.push_str("\n\n");
-        text.push_str(&download_prompt_text(self.config.max_file_mb));
+        text.push_str(&download_prompt_text(self.config.max_file_mb, prompt_limit));
         Ok(text)
     }
 
@@ -2335,7 +2362,12 @@ impl App {
                             total,
                         );
                         telegram
-                            .send_document(chat_id, &file.path, &file.display_name, Some(&caption))
+                            .send_playable_or_document(
+                                chat_id,
+                                &file.path,
+                                &file.display_name,
+                                Some(&caption),
+                            )
                             .await
                     }
                 },
@@ -3160,11 +3192,56 @@ fn help_text(max_file_mb: u64) -> String {
     )
 }
 
-fn download_prompt_text(max_file_mb: u64) -> String {
-    format!(
-        "<b>Download</b>\nChoose all files under {}, or select specific files from torrent metadata.",
-        upload_limit_label(max_file_mb)
-    )
+fn download_prompt_text(max_file_mb: u64, limit: DownloadPromptLimit) -> String {
+    let limit_label = upload_limit_label(max_file_mb);
+    let body = match limit {
+        DownloadPromptLimit::Unknown => format!(
+            "Choose all files under {limit_label}, or select specific files from torrent metadata."
+        ),
+        DownloadPromptLimit::AllFilesFit => {
+            "Choose all files, or select specific files from torrent metadata.".to_string()
+        }
+        DownloadPromptLimit::SomeFilesOversized => format!(
+            "Some files are larger than {limit_label} and cannot be sent. Choose all files under {limit_label}, or select specific files from torrent metadata."
+        ),
+    };
+    format!("<b>Download</b>\n{body}")
+}
+
+fn topic_download_prompt_limit(topic: &TopicDetails, max_file_mb: u64) -> DownloadPromptLimit {
+    let safe_bytes = telegram_safe_file_bytes(max_file_mb);
+    if topic.first_post_files.is_empty() {
+        return DownloadPromptLimit::Unknown;
+    }
+    let mut saw_unknown_size = false;
+    for file in &topic.first_post_files {
+        match file.size_bytes {
+            Some(size) if size > safe_bytes => return DownloadPromptLimit::SomeFilesOversized,
+            Some(_) => {}
+            None => saw_unknown_size = true,
+        }
+    }
+    if saw_unknown_size {
+        DownloadPromptLimit::Unknown
+    } else {
+        DownloadPromptLimit::AllFilesFit
+    }
+}
+
+fn metadata_download_prompt_limit(
+    metadata: &TorrentMetadata,
+    max_file_mb: u64,
+) -> DownloadPromptLimit {
+    let safe_bytes = telegram_safe_file_bytes(max_file_mb);
+    if metadata
+        .files
+        .iter()
+        .any(|file| file.size_bytes > safe_bytes)
+    {
+        DownloadPromptLimit::SomeFilesOversized
+    } else {
+        DownloadPromptLimit::AllFilesFit
+    }
 }
 
 fn upload_limit_label(max_file_mb: u64) -> String {
@@ -3308,6 +3385,17 @@ fn message_has_files_section(text: Option<&str>) -> bool {
                 || line.starts_with("Files from torrent metadata")
         })
     })
+}
+
+fn should_preserve_callback_message_body(
+    progress: Option<ProgressMessage>,
+    current_text: Option<&str>,
+) -> bool {
+    progress.is_some()
+        && match current_text {
+            Some(text) => text.trim().is_empty(),
+            None => true,
+        }
 }
 
 fn resolving_files_text(current_text: Option<&str>) -> String {
@@ -3781,25 +3869,27 @@ mod tests {
         TopicSpoilerImages,
     };
     use crate::telegram::{
-        RichMessageDelivery, TELEGRAM_CAPTION_LIMIT_CHARS, TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS,
-        TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT, TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
+        ProgressMessage, RichMessageDelivery, TELEGRAM_CAPTION_LIMIT_CHARS,
+        TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS, TELEGRAM_RICH_MESSAGE_MEDIA_LIMIT,
+        TELEGRAM_RICH_MESSAGE_TEXT_LIMIT_CHARS, Telegram,
     };
-    use crate::torrent::TorrentFile;
+    use crate::torrent::{TorrentFile, TorrentMetadata};
 
     use super::{
-        App, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails, all_files_button_label,
-        author_description_callback, author_name_link, author_release_search_result,
-        callback_button, category_latest_callback, combined_author_description,
-        comments_next_keyboard, comments_text, download_prompt_reply_markup,
-        downloaded_file_caption, fallback_description_spoiler_images, files_from_topic_text,
-        first_post_image_url, format_author, format_bytes, format_description_html,
-        format_rich_spoiler_image_sections, format_topic_metadata_lines, help_text,
-        image_cache_proxy_url, inline_keyboard, is_author_command, mark_update_seen,
-        message_has_files_section, message_has_section, now_seconds,
-        parse_author_description_callback, parse_comments_callback, remove_callback_button,
-        resolving_files_text, rich_message_payload_char_count, seed_stats_text,
-        selection_file_button_label, telegram_command_name, topic_title_link,
-        verify_vm_worker_signature, vm_worker_signature,
+        App, DownloadPromptLimit, RUTRACKER_NEWS_URL, RUTRACKER_UNAVAILABLE_TEXT, TopicDetails,
+        all_files_button_label, author_description_callback, author_name_link,
+        author_release_search_result, callback_button, category_latest_callback,
+        combined_author_description, comments_next_keyboard, comments_text,
+        download_prompt_reply_markup, download_prompt_text, downloaded_file_caption,
+        fallback_description_spoiler_images, files_from_topic_text, first_post_image_url,
+        format_author, format_bytes, format_description_html, format_rich_spoiler_image_sections,
+        format_topic_metadata_lines, help_text, image_cache_proxy_url, inline_keyboard,
+        is_author_command, mark_update_seen, message_has_files_section, message_has_section,
+        metadata_download_prompt_limit, now_seconds, parse_author_description_callback,
+        parse_comments_callback, remove_callback_button, resolving_files_text,
+        rich_message_payload_char_count, seed_stats_text, selection_file_button_label,
+        should_preserve_callback_message_body, telegram_command_name, topic_download_prompt_limit,
+        topic_title_link, verify_vm_worker_signature, vm_worker_signature,
     };
 
     fn test_app() -> App {
@@ -4048,6 +4138,22 @@ mod tests {
     }
 
     #[test]
+    fn preserves_callback_message_when_body_text_is_unavailable() {
+        let progress = Some(ProgressMessage {
+            chat_id: 7,
+            message_id: 42,
+        });
+
+        assert!(should_preserve_callback_message_body(progress, None));
+        assert!(should_preserve_callback_message_body(progress, Some("  ")));
+        assert!(!should_preserve_callback_message_body(
+            progress,
+            Some("Title\nCategory: Music")
+        ));
+        assert!(!should_preserve_callback_message_body(None, None));
+    }
+
+    #[test]
     fn detects_file_sections() {
         assert!(message_has_files_section(Some(
             "Title\n\nFiles from first post: Album\ntrack.flac - 30 MB"
@@ -4095,13 +4201,20 @@ mod tests {
         let files = files_from_topic_text(&topic, app.config.max_file_mb);
 
         let text = app
-            .topic_message_with_download_prompt(&topic, true, Some(&files))
+            .topic_message_with_download_prompt(
+                &topic,
+                true,
+                Some(&files),
+                topic_download_prompt_limit(&topic, app.config.max_file_mb),
+            )
             .unwrap();
 
         assert!(text.contains("<b>Description</b>"));
         assert!(text.contains("<b>Download</b>"));
         assert!(text.contains("Files from first post"));
         assert!(text.contains("track.flac"));
+        assert!(text.contains("Choose all files, or select specific files"));
+        assert!(!text.contains("Choose all files under"));
     }
 
     #[test]
@@ -4123,13 +4236,111 @@ mod tests {
         );
 
         let text = app
-            .topic_message_with_download_prompt(&topic, true, Some(&files))
+            .topic_message_with_download_prompt(
+                &topic,
+                true,
+                Some(&files),
+                topic_download_prompt_limit(&topic, app.config.max_file_mb),
+            )
             .unwrap();
 
         assert!(text.contains("<b>Description</b>"));
         assert!(text.contains("<b>Download</b>"));
         assert!(!text.contains("Files from first post"));
         assert!(!text.contains("track.flac"));
+    }
+
+    #[test]
+    fn download_prompt_mentions_limit_when_topic_has_oversized_file() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            first_post_files: vec![
+                TopicFile {
+                    path: "small.flac".to_string(),
+                    size_bytes: Some(30 * 1024 * 1024),
+                },
+                TopicFile {
+                    path: "huge.flac".to_string(),
+                    size_bytes: Some(75 * 1024 * 1024),
+                },
+            ],
+            ..TopicDetails::default()
+        };
+
+        let text = app
+            .topic_message_with_download_prompt(
+                &topic,
+                false,
+                None,
+                topic_download_prompt_limit(&topic, app.config.max_file_mb),
+            )
+            .unwrap();
+
+        assert!(text.contains("Some files are larger than 50 MB"));
+        assert!(text.contains("Choose all files under 50 MB"));
+    }
+
+    #[test]
+    fn download_prompt_keeps_limit_when_topic_file_sizes_are_unknown() {
+        let app = test_app();
+        let topic = TopicDetails {
+            topic_id: 42,
+            title: "Album".to_string(),
+            first_post_files: vec![TopicFile {
+                path: "track.flac".to_string(),
+                size_bytes: None,
+            }],
+            ..TopicDetails::default()
+        };
+
+        assert_eq!(
+            topic_download_prompt_limit(&topic, app.config.max_file_mb),
+            DownloadPromptLimit::Unknown
+        );
+        assert!(
+            app.topic_message_with_download_prompt(
+                &topic,
+                false,
+                None,
+                topic_download_prompt_limit(&topic, app.config.max_file_mb),
+            )
+            .unwrap()
+            .contains("Choose all files under 50 MB")
+        );
+    }
+
+    #[test]
+    fn download_prompt_uses_metadata_limit_status() {
+        let fit_metadata = TorrentMetadata {
+            name: "Album".to_string(),
+            info_hash: "hash".to_string(),
+            magnet: None,
+            files: vec![TorrentFile {
+                index: 0,
+                path: "track.flac".into(),
+                size_bytes: 30 * 1024 * 1024,
+            }],
+            torrent_bytes: None,
+        };
+        let oversized_metadata = TorrentMetadata {
+            files: vec![TorrentFile {
+                index: 0,
+                path: "huge.flac".into(),
+                size_bytes: 75 * 1024 * 1024,
+            }],
+            ..fit_metadata.clone()
+        };
+
+        assert_eq!(
+            download_prompt_text(50, metadata_download_prompt_limit(&fit_metadata, 50)),
+            "<b>Download</b>\nChoose all files, or select specific files from torrent metadata."
+        );
+        assert!(
+            download_prompt_text(50, metadata_download_prompt_limit(&oversized_metadata, 50))
+                .contains("Some files are larger than 50 MB")
+        );
     }
 
     #[test]
