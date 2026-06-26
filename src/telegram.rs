@@ -258,15 +258,20 @@ impl Telegram {
         let value = self
             .send_message_value(chat_id, text, None, Some("HTML"))
             .await?;
-        let message_id = value
-            .get("result")
-            .and_then(|result| result.get("message_id"))
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow!("Telegram sendMessage response has no result.message_id"))?;
-        Ok(ProgressMessage {
-            chat_id,
-            message_id,
-        })
+        progress_message_from_send_response(chat_id, value)
+    }
+
+    pub async fn send_status_message_reply_to(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        text: &str,
+    ) -> Result<ProgressMessage> {
+        let mut payload = self.send_message_payload(chat_id, text, None, Some("HTML"));
+        payload["reply_to_message_id"] = json!(reply_to_message_id);
+        payload["allow_sending_without_reply"] = json!(true);
+        let value = self.telegram_json_value("sendMessage", payload).await?;
+        progress_message_from_send_response(chat_id, value)
     }
 
     pub async fn edit_message(
@@ -780,6 +785,18 @@ pub fn truncate_for_telegram(value: &str, limit: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
+}
+
+fn progress_message_from_send_response(chat_id: i64, value: Value) -> Result<ProgressMessage> {
+    let message_id = value
+        .get("result")
+        .and_then(|result| result.get("message_id"))
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("Telegram sendMessage response has no result.message_id"))?;
+    Ok(ProgressMessage {
+        chat_id,
+        message_id,
+    })
 }
 
 fn rich_message_html(value: &str) -> String {

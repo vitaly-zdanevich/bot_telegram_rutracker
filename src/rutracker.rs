@@ -1316,7 +1316,7 @@ fn parse_file_line(line: &str) -> Option<TopicFile> {
     {
         return None;
     }
-    let file_ext = Regex::new(r"(?i)\.[a-z0-9]{1,8}(?:\s|$|\t| - | \(|\[)").ok()?;
+    let file_ext = Regex::new(r"(?i)\.(?:[a-z][a-z0-9]{0,7}|7z)(?:\s|$|\t| - | \(|\[)").ok()?;
     if !file_ext.is_match(&line) {
         return None;
     }
@@ -1333,7 +1333,9 @@ fn parse_file_line(line: &str) -> Option<TopicFile> {
     };
     let path = path
         .trim_matches(['"', '\''])
-        .trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.' || ch == ')' || ch == ' ')
+        .trim_start_matches(|ch: char| {
+            ch.is_ascii_digit() || matches!(ch, '.' | ')' | ' ' | '-' | '–' | '—')
+        })
         .trim()
         .to_string();
     (!path.is_empty()).then_some(TopicFile {
@@ -2348,6 +2350,30 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("returned the login form instead of search results")
+        );
+    }
+
+    #[test]
+    fn file_parser_ignores_dynamic_range_meter_rows() {
+        assert!(parse_file_line("DR4       -0.31 dBFS    -6.61 dBFS      5:05 ?-Лиса").is_none());
+        assert!(parse_file_line("DR5       -0.51 dBFS    -7.30 dBFS      4:28 ?-Волки").is_none());
+    }
+
+    #[test]
+    fn file_parser_keeps_real_file_extensions() {
+        assert_eq!(
+            parse_file_line("01 - First Track.flac - 30 MB"),
+            Some(TopicFile {
+                path: "First Track.flac".to_string(),
+                size_bytes: Some(31_457_280),
+            })
+        );
+        assert_eq!(
+            parse_file_line("archive.7z - 2 MB"),
+            Some(TopicFile {
+                path: "archive.7z".to_string(),
+                size_bytes: Some(2_097_152),
+            })
         );
     }
 

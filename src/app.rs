@@ -52,6 +52,10 @@ const VM_WORKER_SIGNATURE_TTL_SECONDS: u64 = 5 * 60;
 const IMAGE_CACHE_ROUTE_PREFIX: &str = "/image-cache/";
 const IMAGE_CACHE_PROXY_TIMEOUT_SECONDS: u64 = 10;
 const AUTHOR_RELEASES_FORUM_ID: u64 = 1538;
+const FILE_LIST_METADATA_TIMEOUT_SECONDS: u64 = 30;
+const FILE_LIST_METADATA_ATTEMPTS: usize = 1;
+const RESOLVING_FILES_STATUS_TEXT: &str =
+    "Resolving magnet metadata for file list... This can take up to 30 seconds.";
 
 type CacheStore<K, T> = Mutex<HashMap<K, CacheEntry<T>>>;
 
@@ -1708,11 +1712,37 @@ impl App {
         reply_markup: Option<Value>,
         current_text: Option<String>,
     ) -> Result<()> {
+        let preserve_message_body =
+            should_preserve_callback_message_body(message_to_edit, current_text.as_deref());
+        let include_description = message_has_section(current_text.as_deref(), "Description");
+        let files_reply_markup =
+            remove_callback_button(reply_markup.clone(), &format!("files:{topic_id}"));
+        let downloader = self.downloader(topic_id);
+        if let Some(metadata) = self.cached_seed_metadata(topic_id, &downloader).await? {
+            let files = files_from_metadata_text(&metadata.files, self.config.max_file_mb);
+            return self
+                .deliver_local_files_text(
+                    chat_id,
+                    message_to_edit,
+                    current_text.as_deref(),
+                    &files,
+                    files_reply_markup,
+                    preserve_message_body,
+                )
+                .await;
+        }
         let topic = match self.cached_topic(topic_id).await {
             Ok(topic) => topic,
             Err(err) => {
                 if let Some(message_to_edit) = message_to_edit {
-                    self.edit_rutracker_unavailable(message_to_edit, &err)
+                    warn!(error = %err, "RuTracker unavailable for Files request");
+                    self.telegram
+                        .send_message_reply_to(
+                            chat_id,
+                            message_to_edit.message_id,
+                            RUTRACKER_UNAVAILABLE_TEXT,
+                            Some(rutracker_unavailable_keyboard()),
+                        )
                         .await?;
                 } else {
                     self.send_rutracker_unavailable(chat_id, &err).await?;
@@ -1720,14 +1750,21 @@ impl App {
                 return Ok(());
             }
         };
-        let include_description = message_has_section(current_text.as_deref(), "Description");
-        let reply_markup = remove_callback_button(reply_markup, &format!("files:{topic_id}"));
         if !topic.first_post_files.is_empty() {
             let files = files_from_topic_text(&topic, self.config.max_file_mb);
             let text = self.topic_message_with_files(&topic, &files, include_description)?;
             if let Some(message_to_edit) = message_to_edit {
+                if preserve_message_body {
+                    self.telegram
+                        .edit_message_reply_markup(message_to_edit, files_reply_markup)
+                        .await?;
+                    return self
+                        .telegram
+                        .send_message_reply_to(chat_id, message_to_edit.message_id, &text, None)
+                        .await;
+                }
                 self.telegram
-                    .edit_message(message_to_edit, &text, reply_markup)
+                    .edit_message(message_to_edit, &text, files_reply_markup)
                     .await?;
             } else {
                 self.telegram.send_message(chat_id, &text, None).await?;
@@ -1736,32 +1773,65 @@ impl App {
         }
 
         let magnet = require_magnet(&topic)?;
-        let downloader = self.downloader(topic_id);
         let progress = match message_to_edit {
-            Some(progress) => {
-                let resolving_text = resolving_files_text(current_text.as_deref());
+            Some(progress) if preserve_message_body => {
                 self.telegram
-                    .edit_message(progress, &resolving_text, reply_markup.clone())
+                    .edit_message_reply_markup(progress, files_reply_markup.clone())
                     .await?;
-                progress
+                self.telegram
+                    .send_status_message_reply_to(
+                        chat_id,
+                        progress.message_id,
+                        RESOLVING_FILES_STATUS_TEXT,
+                    )
+                    .await?
+            }
+            Some(progress) => {
+                self.telegram
+                    .send_status_message_reply_to(
+                        chat_id,
+                        progress.message_id,
+                        RESOLVING_FILES_STATUS_TEXT,
+                    )
+                    .await?
             }
             None => {
                 self.telegram
-                    .send_status_message(chat_id, "Resolving magnet metadata for file list...")
+                    .send_status_message(chat_id, RESOLVING_FILES_STATUS_TEXT)
                     .await?
             }
         };
         match self
-            .cached_metadata(topic_id, magnet, &downloader, 120)
+            .cached_metadata_with_attempts(
+                topic_id,
+                magnet,
+                &downloader,
+                FILE_LIST_METADATA_TIMEOUT_SECONDS,
+                FILE_LIST_METADATA_ATTEMPTS,
+            )
             .await
         {
             Ok(metadata) => {
                 let files = files_from_metadata_text(&metadata.files, self.config.max_file_mb);
                 let text = self.topic_message_with_files(&topic, &files, include_description)?;
-                if let Some(message_to_edit) = message_to_edit {
-                    self.telegram
-                        .edit_message(message_to_edit, &text, reply_markup)
-                        .await?;
+                if preserve_message_body {
+                    self.telegram.edit_message(progress, &text, None).await?;
+                } else if let Some(message_to_edit) = message_to_edit {
+                    match self
+                        .telegram
+                        .edit_message(message_to_edit, &text, files_reply_markup)
+                        .await
+                    {
+                        Ok(()) => self.telegram.try_delete_message(progress).await,
+                        Err(err) => {
+                            warn!(
+                                topic_id,
+                                error = %err,
+                                "failed to edit original message with file list; keeping status reply"
+                            );
+                            self.telegram.edit_message(progress, &text, None).await?;
+                        }
+                    }
                 } else {
                     self.telegram.try_delete_message(progress).await;
                     self.telegram.send_message(chat_id, &text, None).await?;
@@ -2012,6 +2082,57 @@ impl App {
         }
         cached_metadata_value(topic.topic_id)
             .map(|metadata| files_from_metadata_text(&metadata.files, self.config.max_file_mb))
+    }
+
+    async fn deliver_local_files_text(
+        &self,
+        chat_id: i64,
+        message_to_edit: Option<ProgressMessage>,
+        current_text: Option<&str>,
+        files_text: &str,
+        reply_markup: Option<Value>,
+        preserve_message_body: bool,
+    ) -> Result<()> {
+        let Some(message_to_edit) = message_to_edit else {
+            return self.telegram.send_message(chat_id, files_text, None).await;
+        };
+        if preserve_message_body {
+            self.telegram
+                .edit_message_reply_markup(message_to_edit, reply_markup)
+                .await?;
+            return self
+                .telegram
+                .send_message_reply_to(chat_id, message_to_edit.message_id, files_text, None)
+                .await;
+        }
+        let Some(text) = current_message_with_files(current_text, files_text) else {
+            self.telegram
+                .edit_message_reply_markup(message_to_edit, reply_markup)
+                .await?;
+            return self
+                .telegram
+                .send_message_reply_to(chat_id, message_to_edit.message_id, files_text, None)
+                .await;
+        };
+        match self
+            .telegram
+            .edit_message(message_to_edit, &text, reply_markup.clone())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to edit message with local file list; sending reply instead"
+                );
+                self.telegram
+                    .edit_message_reply_markup(message_to_edit, reply_markup)
+                    .await?;
+                self.telegram
+                    .send_message_reply_to(chat_id, message_to_edit.message_id, files_text, None)
+                    .await
+            }
+        }
     }
 
     async fn handle_select_files(
@@ -2708,6 +2829,24 @@ impl App {
         downloader: &TorrentDownloader,
         timeout_seconds: u64,
     ) -> Result<TorrentMetadata> {
+        self.cached_metadata_with_attempts(
+            topic_id,
+            magnet,
+            downloader,
+            timeout_seconds,
+            crate::downloader::MAGNET_METADATA_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
+    async fn cached_metadata_with_attempts(
+        &self,
+        topic_id: u64,
+        magnet: &str,
+        downloader: &TorrentDownloader,
+        timeout_seconds: u64,
+        max_attempts: usize,
+    ) -> Result<TorrentMetadata> {
         if let Some(value) = cache_get(
             METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
             &topic_id,
@@ -2715,7 +2854,7 @@ impl App {
             return Ok(value);
         }
         let value = downloader
-            .metadata_from_magnet(magnet, timeout_seconds)
+            .metadata_from_magnet_with_attempts(magnet, timeout_seconds, max_attempts)
             .await?;
         cache_set(
             METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
@@ -2723,6 +2862,28 @@ impl App {
             value.clone(),
         );
         Ok(value)
+    }
+
+    async fn cached_seed_metadata(
+        &self,
+        topic_id: u64,
+        downloader: &TorrentDownloader,
+    ) -> Result<Option<TorrentMetadata>> {
+        if let Some(value) = cache_get(
+            METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            &topic_id,
+        ) {
+            return Ok(Some(value));
+        }
+        let Some(value) = downloader.metadata_from_seed_cache().await? else {
+            return Ok(None);
+        };
+        cache_set(
+            METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            topic_id,
+            value.clone(),
+        );
+        Ok(Some(value))
     }
 
     async fn download_magnet(&self, topic_id: u64) -> Result<String> {
@@ -3378,13 +3539,33 @@ fn message_has_section(text: Option<&str>, section: &str) -> bool {
 }
 
 fn message_has_files_section(text: Option<&str>) -> bool {
-    text.is_some_and(|text| {
-        text.lines().any(|line| {
-            let line = line.trim();
-            line.starts_with("Files from first post:")
-                || line.starts_with("Files from torrent metadata")
-        })
-    })
+    text.is_some_and(|text| text.lines().any(is_files_section_start))
+}
+
+fn is_files_section_start(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("Files from first post:") || line.starts_with("Files from torrent metadata")
+}
+
+fn current_message_with_files(current_text: Option<&str>, files_text: &str) -> Option<String> {
+    let current_text = current_text
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    let base = current_text
+        .lines()
+        .take_while(|line| !is_files_section_start(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let base = base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let text = format!("{}\n\n{files_text}", html_escape(base));
+    if text.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 fn should_preserve_callback_message_body(
@@ -3398,16 +3579,16 @@ fn should_preserve_callback_message_body(
         }
 }
 
+#[cfg(test)]
 fn resolving_files_text(current_text: Option<&str>) -> String {
-    const STATUS: &str = "Resolving magnet metadata for file list...";
     let Some(current_text) = current_text.map(str::trim).filter(|text| !text.is_empty()) else {
-        return STATUS.to_string();
+        return RESOLVING_FILES_STATUS_TEXT.to_string();
     };
-    let with_status = format!("{current_text}\n\n{STATUS}");
+    let with_status = format!("{current_text}\n\n{RESOLVING_FILES_STATUS_TEXT}");
     if with_status.chars().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS {
         with_status
     } else {
-        STATUS.to_string()
+        RESOLVING_FILES_STATUS_TEXT.to_string()
     }
 }
 
@@ -3880,16 +4061,17 @@ mod tests {
         all_files_button_label, author_description_callback, author_name_link,
         author_release_search_result, callback_button, category_latest_callback,
         combined_author_description, comments_next_keyboard, comments_text,
-        download_prompt_reply_markup, download_prompt_text, downloaded_file_caption,
-        fallback_description_spoiler_images, files_from_topic_text, first_post_image_url,
-        format_author, format_bytes, format_description_html, format_rich_spoiler_image_sections,
-        format_topic_metadata_lines, help_text, image_cache_proxy_url, inline_keyboard,
-        is_author_command, mark_update_seen, message_has_files_section, message_has_section,
-        metadata_download_prompt_limit, now_seconds, parse_author_description_callback,
-        parse_comments_callback, remove_callback_button, resolving_files_text,
-        rich_message_payload_char_count, seed_stats_text, selection_file_button_label,
-        should_preserve_callback_message_body, telegram_command_name, topic_download_prompt_limit,
-        topic_title_link, verify_vm_worker_signature, vm_worker_signature,
+        current_message_with_files, download_prompt_reply_markup, download_prompt_text,
+        downloaded_file_caption, fallback_description_spoiler_images, files_from_topic_text,
+        first_post_image_url, format_author, format_bytes, format_description_html,
+        format_rich_spoiler_image_sections, format_topic_metadata_lines, help_text,
+        image_cache_proxy_url, inline_keyboard, is_author_command, mark_update_seen,
+        message_has_files_section, message_has_section, metadata_download_prompt_limit,
+        now_seconds, parse_author_description_callback, parse_comments_callback,
+        remove_callback_button, resolving_files_text, rich_message_payload_char_count,
+        seed_stats_text, selection_file_button_label, should_preserve_callback_message_body,
+        telegram_command_name, topic_download_prompt_limit, topic_title_link,
+        verify_vm_worker_signature, vm_worker_signature,
     };
 
     fn test_app() -> App {
@@ -4167,6 +4349,32 @@ mod tests {
     }
 
     #[test]
+    fn appends_local_files_to_current_message() {
+        let text = current_message_with_files(
+            Some("Title & Artist\nCategory: Music"),
+            "<b>Files from torrent metadata</b>\ntrack.flac — 30.0 MB",
+        )
+        .unwrap();
+
+        assert!(text.starts_with("Title &amp; Artist\nCategory: Music"));
+        assert!(text.contains("<b>Files from torrent metadata</b>"));
+        assert!(text.contains("track.flac"));
+    }
+
+    #[test]
+    fn replaces_existing_files_section_in_current_message() {
+        let text = current_message_with_files(
+            Some("Title\n\nFiles from torrent metadata\nold.flac — 1.0 MB"),
+            "<b>Files from torrent metadata</b>\nnew.flac — 2.0 MB",
+        )
+        .unwrap();
+
+        assert!(text.contains("Title"));
+        assert!(text.contains("new.flac"));
+        assert!(!text.contains("old.flac"));
+    }
+
+    #[test]
     fn resolving_files_text_preserves_current_message_when_it_fits() {
         let text = resolving_files_text(Some("Title\nCategory: Music"));
 
@@ -4178,7 +4386,10 @@ mod tests {
     fn resolving_files_text_falls_back_when_current_message_is_too_large() {
         let text = resolving_files_text(Some(&"x".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT_CHARS)));
 
-        assert_eq!(text, "Resolving magnet metadata for file list...");
+        assert_eq!(
+            text,
+            "Resolving magnet metadata for file list... This can take up to 30 seconds."
+        );
     }
 
     #[test]

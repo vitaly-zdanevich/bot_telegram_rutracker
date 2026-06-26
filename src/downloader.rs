@@ -12,12 +12,13 @@ use librqbit::{
     ListenerMode, ListenerOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStats,
 };
 use nix::sys::statvfs::statvfs;
+use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
 use crate::telegram_safe_file_bytes;
-use crate::torrent::{TorrentFile, TorrentMetadata, build_magnet};
+use crate::torrent::{TorrentFile, TorrentMetadata, build_magnet, parse_torrent_bytes};
 
 #[derive(Debug)]
 pub struct DownloadOutcome {
@@ -76,9 +77,20 @@ struct SeedSessionKey {
     peer_limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct PersistedSeedSession {
+    torrents: HashMap<String, PersistedSeedTorrent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersistedSeedTorrent {
+    info_hash: String,
+    output_folder: PathBuf,
+}
+
 static SEED_SESSIONS: OnceLock<Mutex<HashMap<SeedSessionKey, Arc<Session>>>> = OnceLock::new();
 static SEED_DOWNLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-const MAGNET_METADATA_MAX_ATTEMPTS: usize = 5;
+pub(crate) const MAGNET_METADATA_MAX_ATTEMPTS: usize = 5;
 
 impl TorrentDownloader {
     pub fn new(output_dir: PathBuf, peer_limit: usize) -> Self {
@@ -145,9 +157,109 @@ impl TorrentDownloader {
         magnet: &str,
         timeout_seconds: u64,
     ) -> Result<TorrentMetadata> {
+        self.metadata_from_magnet_with_attempts(
+            magnet,
+            timeout_seconds,
+            MAGNET_METADATA_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
+    /// Reads metadata for a torrent already persisted in the VM seed session.
+    ///
+    /// This is a local fast path for read-only UI actions such as `Files`: if a
+    /// topic was already downloaded into its stable seed folder, we can parse
+    /// rqbit's saved `.torrent` file instead of scraping RuTracker or resolving
+    /// magnet metadata again.
+    pub async fn metadata_from_seed_cache(&self) -> Result<Option<TorrentMetadata>> {
+        let Some(seed_config) = self.seed_config.as_ref() else {
+            return Ok(None);
+        };
+        let session_dir = seed_config.root_dir.join(".rqbit-session");
+        let session_path = session_dir.join("session.json");
+        let bytes = match tokio::fs::read(&session_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                warn!(
+                    path = %session_path.display(),
+                    error = %err,
+                    "failed to read rqbit seed persistence"
+                );
+                return Ok(None);
+            }
+        };
+        let persisted = match serde_json::from_slice::<PersistedSeedSession>(&bytes) {
+            Ok(persisted) => persisted,
+            Err(err) => {
+                warn!(
+                    path = %session_path.display(),
+                    error = %err,
+                    "failed to parse rqbit seed persistence"
+                );
+                return Ok(None);
+            }
+        };
+        for torrent in persisted.torrents.values() {
+            if !paths_match(&torrent.output_folder, &self.output_dir).await {
+                continue;
+            }
+            let torrent_path = session_dir.join(format!("{}.torrent", torrent.info_hash));
+            let torrent_bytes = match tokio::fs::read(&torrent_path).await {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    warn!(
+                        path = %torrent_path.display(),
+                        "rqbit seed persistence matched topic folder but torrent file is missing"
+                    );
+                    return Ok(None);
+                }
+                Err(err) => {
+                    warn!(
+                        path = %torrent_path.display(),
+                        error = %err,
+                        "failed to read persisted torrent file"
+                    );
+                    return Ok(None);
+                }
+            };
+            let mut metadata = match parse_torrent_bytes(torrent_bytes.clone()) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    warn!(
+                        path = %torrent_path.display(),
+                        error = %err,
+                        "failed to parse persisted torrent file"
+                    );
+                    return Ok(None);
+                }
+            };
+            metadata.torrent_bytes = Some(torrent_bytes);
+            info!(
+                output_dir = %self.output_dir.display(),
+                info_hash = %metadata.info_hash,
+                files = metadata.files.len(),
+                "loaded torrent metadata from local seed cache"
+            );
+            return Ok(Some(metadata));
+        }
+        Ok(None)
+    }
+
+    /// Resolves torrent metadata with a caller-specific retry budget.
+    ///
+    /// Interactive read-only views can use a small budget so Telegram does not
+    /// look stuck, while download flows keep the patient default retry policy.
+    pub async fn metadata_from_magnet_with_attempts(
+        &self,
+        magnet: &str,
+        timeout_seconds: u64,
+        max_attempts: usize,
+    ) -> Result<TorrentMetadata> {
+        let max_attempts = max_attempts.max(1);
         let session = self.session().await?;
         let mut last_error = None;
-        for attempt in 1..=MAGNET_METADATA_MAX_ATTEMPTS {
+        for attempt in 1..=max_attempts {
             match resolve_magnet_metadata_once(&session, magnet, timeout_seconds, self.peer_limit)
                 .await
             {
@@ -155,8 +267,7 @@ impl TorrentDownloader {
                     if attempt > 1 {
                         info!(
                             attempt,
-                            max_attempts = MAGNET_METADATA_MAX_ATTEMPTS,
-                            "magnet metadata resolution succeeded after retry"
+                            max_attempts, "magnet metadata resolution succeeded after retry"
                         );
                     }
                     return Ok(metadata);
@@ -164,19 +275,24 @@ impl TorrentDownloader {
                 Err(err) => {
                     warn!(
                         attempt,
-                        max_attempts = MAGNET_METADATA_MAX_ATTEMPTS,
+                        max_attempts,
                         error = %err,
                         "magnet metadata resolution attempt failed"
                     );
                     last_error = Some(err);
-                    if attempt < MAGNET_METADATA_MAX_ATTEMPTS {
+                    if attempt < max_attempts {
                         sleep(magnet_metadata_retry_delay(attempt)).await;
                     }
                 }
             }
         }
+        let attempts_label = if max_attempts == 1 {
+            "1 attempt".to_string()
+        } else {
+            format!("{max_attempts} attempts")
+        };
         Err(last_error.unwrap_or_else(|| anyhow!("magnet metadata resolution was not attempted")))
-            .context("failed to resolve magnet metadata after 5 attempts")
+            .with_context(|| format!("failed to resolve magnet metadata after {attempts_label}"))
     }
 
     pub async fn download_small_files<F, Fut>(
@@ -422,6 +538,19 @@ async fn seed_session(seed_config: &SeedConfig, peer_limit: usize) -> Result<Arc
     }
     guard.insert(key, session.clone());
     Ok(session)
+}
+
+async fn paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let Ok(left) = tokio::fs::canonicalize(left).await else {
+        return false;
+    };
+    let Ok(right) = tokio::fs::canonicalize(right).await else {
+        return false;
+    };
+    left == right
 }
 
 async fn ensure_seed_capacity(
@@ -700,8 +829,11 @@ pub fn torrent_bytes_as_add(bytes: Vec<u8>) -> AddTorrent<'static> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAGNET_METADATA_MAX_ATTEMPTS, cleanup_stale_download_dirs, magnet_metadata_retry_delay,
+        MAGNET_METADATA_MAX_ATTEMPTS, SeedConfig, TorrentDownloader, cleanup_stale_download_dirs,
+        magnet_metadata_retry_delay,
     };
+    use crate::torrent::parse_torrent_bytes;
+    use lava_torrent::torrent::v1::TorrentBuilder;
     use std::time::Duration;
 
     #[test]
@@ -727,5 +859,66 @@ mod tests {
         assert!(!stale.exists());
         assert!(current.exists());
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn reads_metadata_from_seed_cache_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_dir = tmp.path().join("seeds");
+        let output_dir = root_dir.join("rutracker-42");
+        let session_dir = root_dir.join(".rqbit-session");
+        tokio::fs::create_dir_all(&output_dir).await.unwrap();
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let file_path = output_dir.join("track.flac");
+        tokio::fs::write(&file_path, vec![1_u8; 123]).await.unwrap();
+
+        let torrent_bytes = TorrentBuilder::new(file_path.to_str().unwrap(), 16_384)
+            .set_announce(Some("udp://tracker".to_string()))
+            .build()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let expected = parse_torrent_bytes(torrent_bytes.clone()).unwrap();
+        tokio::fs::write(
+            session_dir.join(format!("{}.torrent", expected.info_hash)),
+            &torrent_bytes,
+        )
+        .await
+        .unwrap();
+        let session = serde_json::json!({
+            "torrents": {
+                "0": {
+                    "info_hash": expected.info_hash.clone(),
+                    "trackers": ["udp://tracker"],
+                    "output_folder": output_dir.to_string_lossy(),
+                    "only_files": [0],
+                    "is_paused": false
+                }
+            }
+        });
+        tokio::fs::write(session_dir.join("session.json"), session.to_string())
+            .await
+            .unwrap();
+
+        let downloader = TorrentDownloader::new(output_dir, 1).with_seed_config(SeedConfig {
+            root_dir,
+            listen_port: 49152,
+            disk_reserve_bytes: 0,
+        });
+
+        let loaded = downloader
+            .metadata_from_seed_cache()
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded.name, "track.flac");
+        assert_eq!(loaded.info_hash, expected.info_hash);
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[0].size_bytes, 123);
+        assert_eq!(
+            loaded.torrent_bytes.as_deref(),
+            Some(torrent_bytes.as_slice())
+        );
     }
 }
