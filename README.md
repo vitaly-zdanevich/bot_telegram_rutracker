@@ -238,3 +238,5 @@ cargo test
 ```
 
 Tests include mock RuTracker HTML fixtures for search results, topic metadata, first-post files/images, comments page counts, and category parsing.
+
+My lecture about this bot - in Russian https://www.youtube.com/watch?v=rySzzssB4iA
